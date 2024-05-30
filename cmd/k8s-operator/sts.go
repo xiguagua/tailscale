@@ -188,7 +188,7 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 	// 	return nil, fmt.Errorf("failed to reconcile headless service: %w", err)
 	// }
 
-	// Create Secret for each CIDR
+	// Create Secret for each proxy replica
 	for i, cidrS := range sts.serviceCIDRs {
 		cidr, err := netip.ParsePrefix(cidrS)
 		if err != nil {
@@ -197,6 +197,10 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 		_, _, _, err = a.createOrGetSecret(ctx, logger, sts, i, cidr)
 		if err != nil {
 			return fmt.Errorf("failed to create or get API key secret: %w", err)
+		}
+		_, err = a.createOrGetCM(ctx, logger, sts, i)
+		if err != nil {
+			return fmt.Errorf("failed to create or get services ConfigMap: %w", err)
 		}
 	}
 
@@ -313,6 +317,25 @@ func (a *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, l
 	}
 	logger.Debugf("reconciling headless service for StatefulSet", "namebase", nameBase)
 	return createOrUpdate(ctx, a.Client, a.operatorNamespace, hsvc, func(svc *corev1.Service) { svc.Spec = hsvc.Spec })
+}
+func (a *tailscaleSTSReconciler) createOrGetCM(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, i int) (string, error) {
+	hostname := fmt.Sprintf("%s-%d", stsC.name, i)
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            hostname,
+			Namespace:       a.operatorNamespace,
+			Labels:          map[string]string{"proxy-index": hostname, "proxies": stsC.name},
+			OwnerReferences: []metav1.OwnerReference{*stsC.clusterConfOwnerRef},
+		},
+	}
+	if err := a.Get(ctx, client.ObjectKeyFromObject(cm), cm); apierrors.IsNotFound(err) {
+		logger.Infof("creating services ConfigMap %s", hostname)
+		createErr := a.Create(ctx, cm)
+		return hostname, createErr
+	} else if err != nil {
+		return "", fmt.Errorf("error getting ConfigMap %s", hostname)
+	}
+	return hostname, nil
 }
 
 func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, i int, serviceCIDR netip.Prefix) (secretName, hash string, configs tailscaleConfigs, _ error) {
@@ -526,12 +549,18 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 			Name:  "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR",
 			Value: "/etc/tsconfig/$(POD_NAME)",
 		},
+		corev1.EnvVar{
+			// New style is in the form of cap-<capability-version>.hujson.
+			Name:  "TS_EXPERIMENTAL_SERVICES_CONFIG",
+			Value: "/etc/services/$(POD_NAME)",
+		},
 	)
 
 	// Mount all tailscaled configs, each Pod only reads the one from
 	// $(POD_NAME) Secret.
 	// There is no way how to mount a different Secret for each replica.
 	for i := range len(sts.serviceCIDRs) {
+		// Mount the individual tailscaled state for each replica
 		configVolume := corev1.Volume{
 			Name: fmt.Sprintf("tailscaledconfig-%d", i),
 			VolumeSource: corev1.VolumeSource{
@@ -545,6 +574,22 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 			Name:      fmt.Sprintf("tailscaledconfig-%d", i),
 			ReadOnly:  true,
 			MountPath: fmt.Sprintf("/etc/tsconfig/%s-%d", sts.name, i),
+		})
+
+		servicesConfigV := corev1.Volume{
+			Name: fmt.Sprintf("servicesconfig-%d", i),
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: fmt.Sprintf("%s-%d", sts.name, i)},
+				},
+			},
+		}
+		pod.Spec.Volumes = append(ss.Spec.Template.Spec.Volumes, servicesConfigV)
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      fmt.Sprintf("servicesconfig-%d", i),
+			ReadOnly:  true,
+			MountPath: fmt.Sprintf("/etc/services-%d/", i),
+			// SubPath:   fmt.Sprintf("%s-%d", sts.name, i),
 		})
 	}
 

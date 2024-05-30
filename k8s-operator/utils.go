@@ -60,23 +60,13 @@ func CapVerFromFileName(name string) (tailcfg.CapabilityVersion, error) {
 	return cap, err
 }
 
-// TODO: this should be a CRD
-type ServiceConfig struct {
-	Version          string             `json:"version"`
-	ServicesPerClass []ServicesPerClass `json:"servicesPerClass"`
-}
-
-type ServicesPerClass struct {
-	ClassName string    `json:"className"`
-	Services  []Service `json:"services"`
-}
-
 type Service struct {
-	IP      string   `json:"ip"`
-	Ingress *Ingress `json:"ingress"`
+	V4ServiceIPs string   `json:"vService4ips"`
+	FQDN         string   `json:"fqdn"`
+	Ingress      *Ingress `json:"ingress"`
 }
 
 type Ingress struct {
-	Type     string   `json:"type"` // tcp or http
-	Backends []string `json:"backends"`
+	Type       string   `json:"type"` // tcp or http
+	V4Backends []string `json:"v4Backends"`
 }
