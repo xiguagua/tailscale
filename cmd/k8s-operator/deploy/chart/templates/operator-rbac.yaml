@@ -27,6 +27,9 @@ rules:
 - apiGroups: ["tailscale.com"]
   resources: ["dnsconfigs", "dnsconfigs/status"]
   verbs: ["get", "list", "watch", "update"]
+- apiGroups: ["tailscale.com"]
+  resources: ["clusterconfigs", "clusterconfigs/status"]
+  verbs: ["get", "list", "watch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

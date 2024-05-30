@@ -8,8 +8,11 @@ package kube
 import (
 	"fmt"
 
+	"github.com/gaissmai/bart"
 	"tailscale.com/tailcfg"
 )
+
+// TODO: move all this to ./kube
 
 const (
 	Alpha1Version = "v1alpha1"
@@ -24,8 +27,17 @@ type Records struct {
 	// k8s-nameserver must verify that it knows how to parse a given
 	// version.
 	Version string `json:"version"`
+
+	// This will go- this will only contain ingress/egress destinations, not what
+	// service IPs this is assigned to.
+
 	// IP4 contains a mapping of DNS names to IPv4 address(es).
 	IP4 map[string][]string `json:"ip4"`
+	// TODO: probably don't need this here
+	AddrsToDomain *bart.Table[string] `json:"addrsToDomain"`
+	// Probably should not be a string so that don't need to parse twice
+	// TODO: remove from here
+	DNSAddr string `json:"dnsAddr"`
 }
 
 // TailscaledConfigFileNameForCap returns a tailscaled config file name in
@@ -46,4 +58,25 @@ func CapVerFromFileName(name string) (tailcfg.CapabilityVersion, error) {
 	var cap tailcfg.CapabilityVersion
 	_, err := fmt.Sscanf(name, "cap-%d.hujson", &cap)
 	return cap, err
+}
+
+// TODO: this should be a CRD
+type ServiceConfig struct {
+	Version          string             `json:"version"`
+	ServicesPerClass []ServicesPerClass `json:"servicesPerClass"`
+}
+
+type ServicesPerClass struct {
+	ClassName string    `json:"className"`
+	Services  []Service `json:"services"`
+}
+
+type Service struct {
+	IP      string   `json:"ip"`
+	Ingress *Ingress `json:"ingress"`
+}
+
+type Ingress struct {
+	Type     string   `json:"type"` // tcp or http
+	Backends []string `json:"backends"`
 }

@@ -7,7 +7,10 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"slices"
 	"strings"
@@ -20,6 +23,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	kube "tailscale.com/k8s-operator"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/net/dns/resolvconffile"
@@ -28,8 +32,9 @@ import (
 )
 
 const (
-	resolvConfPath       = "/etc/resolv.conf"
-	defaultClusterDomain = "cluster.local"
+	resolvConfPath           = "/etc/resolv.conf"
+	defaultClusterDomain     = "cluster.local"
+	serviceDNSNameAnnotation = "tailscale.com/service-dns-name"
 )
 
 type ServiceReconciler struct {
@@ -150,147 +155,91 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 // This function adds a finalizer to svc, ensuring that we can handle orderly
 // deprovisioning later.
 func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.SugaredLogger, svc *corev1.Service) error {
-	// Run for proxy config related validations here as opposed to running
-	// them earlier. This is to prevent cleanup being blocked on a
-	// misconfigured proxy param.
-	if err := a.ssr.validate(); err != nil {
-		msg := fmt.Sprintf("unable to provision proxy resources: invalid config: %v", err)
-		a.recorder.Event(svc, corev1.EventTypeWarning, "INVALIDCONFIG", msg)
-		a.logger.Error(msg)
-		return nil
-	}
-	if violations := validateService(svc); len(violations) > 0 {
-		msg := fmt.Sprintf("unable to provision proxy resources: invalid Service: %s", strings.Join(violations, ", "))
-		a.recorder.Event(svc, corev1.EventTypeWarning, "INVALIDSERVCICE", msg)
-		a.logger.Error(msg)
+	// Take a look at the Service
+	// If it is an ingress Service (expose annotation or load balancer)
+	// Add a record to the config map
+
+	// This prototype only looks at ingress Services
+	if !a.shouldExpose(svc) {
 		return nil
 	}
 
-	proxyClass := proxyClassForObject(svc)
-	if proxyClass != "" {
-		if ready, err := proxyClassIsReady(ctx, proxyClass, a.Client); err != nil {
-			return fmt.Errorf("error verifying ProxyClass for Service: %w", err)
-		} else if !ready {
-			logger.Infof("ProxyClass %s specified for the Service, but is not (yet) Ready, waiting..", proxyClass)
-			return nil
+	// get clusterconfig
+	// Exactly one ClusterConfig needs to exist, else we don't proceed.
+	ccl := &tsapi.ClusterConfigList{}
+	if err := a.List(ctx, ccl); err != nil {
+		return fmt.Errorf("error listing ClusterConfigs: %w", err)
+	}
+	if len(ccl.Items) < 1 {
+		logger.Info("got %d ClusterConfigs", len(ccl.Items))
+		return nil
+	}
+	cc := ccl.Items[0]
+
+	cm := &corev1.ConfigMap{}
+	if err := a.Get(ctx, types.NamespacedName{Namespace: a.tsNamespace, Name: "servicerecords"}, cm); err != nil {
+		return fmt.Errorf("error getting serviceRecords ConfigMap: %w", err)
+	}
+	// determine DNS name
+	svcDNSName := dnsNameForSvc(svc, cc.Spec.Domain)
+
+	// serviceRecords := &kube.Records{Version: kube.Alpha1Version}
+
+	// TODO: don't do any of this, the operator will just distribute the destinations.
+	// Containerboot itself will allocate a client -> address pair for each endpoint
+	var serviceRecords *kube.Records
+	if serviceRecordsB := cm.BinaryData["servicerecords.json"]; len(serviceRecordsB) == 0 {
+		serviceRecords = &kube.Records{Version: kube.Alpha1Version}
+	} else {
+		if err := json.Unmarshal(cm.BinaryData["servicerecords.json"], serviceRecords); err != nil {
+			return fmt.Errorf("error unmarshalling service records: %w", err)
 		}
 	}
 
-	hostname, err := nameForService(svc)
-	if err != nil {
-		return err
-	}
-
-	if !slices.Contains(svc.Finalizers, FinalizerName) {
-		// This log line is printed exactly once during initial provisioning,
-		// because once the finalizer is in place this block gets skipped. So,
-		// this is a nice place to tell the operator that the high level,
-		// multi-reconcile operation is underway.
-		logger.Infof("exposing service over tailscale")
-		svc.Finalizers = append(svc.Finalizers, FinalizerName)
-		if err := a.Update(ctx, svc); err != nil {
-			return fmt.Errorf("failed to add finalizer: %w", err)
-		}
-	}
-	crl := childResourceLabels(svc.Name, svc.Namespace, "svc")
-	var tags []string
-	if tstr, ok := svc.Annotations[AnnotationTags]; ok {
-		tags = strings.Split(tstr, ",")
-	}
-
-	sts := &tailscaleSTSConfig{
-		ParentResourceName:  svc.Name,
-		ParentResourceUID:   string(svc.UID),
-		Hostname:            hostname,
-		Tags:                tags,
-		ChildResourceLabels: crl,
-		ProxyClass:          proxyClass,
-	}
-
-	a.mu.Lock()
-	if a.shouldExposeClusterIP(svc) {
-		sts.ClusterTargetIP = svc.Spec.ClusterIP
-		a.managedIngressProxies.Add(svc.UID)
-		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
-	} else if a.shouldExposeDNSName(svc) {
-		sts.ClusterTargetDNSName = svc.Spec.ExternalName
-		a.managedIngressProxies.Add(svc.UID)
-		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
-	} else if ip := tailnetTargetAnnotation(svc); ip != "" {
-		sts.TailnetTargetIP = ip
-		a.managedEgressProxies.Add(svc.UID)
-		gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
-	} else if fqdn := svc.Annotations[AnnotationTailnetTargetFQDN]; fqdn != "" {
-		fqdn := svc.Annotations[AnnotationTailnetTargetFQDN]
-		if !strings.HasSuffix(fqdn, ".") {
-			fqdn = fqdn + "."
-		}
-		sts.TailnetTargetFQDN = fqdn
-		a.managedEgressProxies.Add(svc.UID)
-		gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
-	}
-	a.mu.Unlock()
-
-	var hsvc *corev1.Service
-	if hsvc, err = a.ssr.Provision(ctx, logger, sts); err != nil {
-		return fmt.Errorf("failed to provision: %w", err)
-	}
-
-	if sts.TailnetTargetIP != "" || sts.TailnetTargetFQDN != "" {
-		clusterDomain := retrieveClusterDomain(a.tsNamespace, logger)
-		headlessSvcName := hsvc.Name + "." + hsvc.Namespace + ".svc." + clusterDomain
-		if svc.Spec.ExternalName != headlessSvcName || svc.Spec.Type != corev1.ServiceTypeExternalName {
-			svc.Spec.ExternalName = headlessSvcName
-			svc.Spec.Selector = nil
-			svc.Spec.Type = corev1.ServiceTypeExternalName
-			if err := a.Update(ctx, svc); err != nil {
-				return fmt.Errorf("failed to update service: %w", err)
-			}
-		}
+	if ip, ok := serviceRecords.IP4[svcDNSName]; ok {
+		logger.Infof("Record for %s found with an IP address %s", svcDNSName, ip)
 		return nil
 	}
 
-	if !isTailscaleLoadBalancerService(svc, a.isDefaultLoadBalancer) {
-		logger.Debugf("service is not a LoadBalancer, so not updating ingress")
-		return nil
-	}
+	// for this prototype, only look at the default class
+	// var defaultClass tsapi.Class
+	// for _, class := range cc.Spec.Classes {
+	// 	if class.Name == "default" {
+	// 		defaultClass = class
+	// 		break
+	// 	}
+	// }
+	// var v4Prefixes []netip.Prefix
+	// for _, s := range strings.Split(defaultClass.CIDRv4, ",") {
+	// 	p := netip.MustParsePrefix(strings.TrimSpace(s))
+	// 	if p.Masked() != p {
+	// 		log.Fatalf("v4 prefix %v is not a masked prefix", p)
+	// 	}
+	// 	v4Prefixes = append(v4Prefixes, p)
+	// }
+	// if len(v4Prefixes) == 0 {
+	// 	log.Fatalf("no v4 prefixes specified")
+	// }
 
-	_, tsHost, tsIPs, err := a.ssr.DeviceInfo(ctx, crl)
-	if err != nil {
-		return fmt.Errorf("failed to get device ID: %w", err)
-	}
-	if tsHost == "" {
-		logger.Debugf("no Tailscale hostname known yet, waiting for proxy pod to finish auth")
-		// No hostname yet. Wait for the proxy pod to auth.
-		svc.Status.LoadBalancer.Ingress = nil
-		if err := a.Status().Update(ctx, svc); err != nil {
-			return fmt.Errorf("failed to update service status: %w", err)
-		}
-		return nil
-	}
+	// convert the DNS address
+	// it should have been written by the proxies reconciler
+	// dnsAddr, err := netip.ParseAddr(serviceRecords.DNSAddr)
+	// if err != nil {
+	// 	return fmt.Errorf("error parsing DNS address %s: %w", serviceRecords.DNSAddr, err)
+	// }
 
-	logger.Debugf("setting ingress to %q, %s", tsHost, strings.Join(tsIPs, ", "))
-	ingress := []corev1.LoadBalancerIngress{
-		{Hostname: tsHost},
-	}
-	clusterIPAddr, err := netip.ParseAddr(svc.Spec.ClusterIP)
-	if err != nil {
-		return fmt.Errorf("failed to parse cluster IP: %w", err)
-	}
-	for _, ip := range tsIPs {
-		addr, err := netip.ParseAddr(ip)
-		if err != nil {
-			continue
-		}
-		if addr.Is4() == clusterIPAddr.Is4() { // only add addresses of the same family
-			ingress = append(ingress, corev1.LoadBalancerIngress{IP: ip})
-		}
-	}
-	svc.Status.LoadBalancer.Ingress = ingress
-	if err := a.Status().Update(ctx, svc); err != nil {
-		return fmt.Errorf("failed to update service status: %w", err)
-	}
-	return nil
+	// ip := unusedIPv4(v4Prefixes, *serviceRecords, dnsAddr)
+
+	// now write the IP to the configmap
+	// serviceRecords.AddrsToDomain.Insert(netip.PrefixFrom(ip, ip.BitLen()), svcDNSName)
+	// serviceRecords.IP4[svcDNSName] = []string{ip.String()}
+
+	// serviceRecordsB, err := json.Marshal(serviceRecords)
+	// if err != nil {
+	// 	return fmt.Errorf("error marshalling serviceRecords: %w", err)
+	// }
+	// cm.BinaryData["serviceRecords"] = serviceRecordsB
+	return a.Update(ctx, cm)
 }
 
 func validateService(svc *corev1.Service) []string {
@@ -407,3 +356,45 @@ func clusterDomainFromResolverConf(conf *resolvconffile.Config, namespace string
 	logger.Infof("Cluster domain %q extracted from resolver config", probablyClusterDomain)
 	return probablyClusterDomain
 }
+
+func dnsNameForSvc(svc *corev1.Service, clusterDomain string) string {
+	if a := svc.Annotations["tailscale.com/service-dns-name"]; a != "" {
+		return a + "." + clusterDomain
+	}
+	return svc.Name + "-" + svc.Namespace + "." + clusterDomain
+}
+
+func unusedIPv4(serviceCIDR []netip.Prefix, serviceRecords kube.Records, dnsAddr netip.Addr) netip.Addr {
+	for _, r := range serviceCIDR {
+		ip := randV4(r)
+		for r.Contains(ip) {
+			if !isIPUsed(ip, serviceRecords) && ip != dnsAddr {
+				return ip
+			}
+			ip = ip.Next()
+		}
+	}
+	return netip.Addr{}
+}
+
+func isIPUsed(ip netip.Addr, serviceRecords kube.Records) bool {
+	_, ok := serviceRecords.AddrsToDomain.Get(ip)
+	return ok
+}
+
+// randV4 returns a random IPv4 address within the given prefix.
+func randV4(maskedPfx netip.Prefix) netip.Addr {
+	bits := 32 - maskedPfx.Bits()
+	randBits := rand.Uint32N(1 << uint(bits))
+
+	ip4 := maskedPfx.Addr().As4()
+	pn := binary.BigEndian.Uint32(ip4[:])
+	binary.BigEndian.PutUint32(ip4[:], randBits|pn)
+	return netip.AddrFrom4(ip4)
+}
+
+// domainForIP returns the domain name assigned to the given IP address and
+// whether it was found.
+// func domainForIP(ip netip.Addr, serviceRecords ) (string, bool) {
+// 	return ps.addrToDomain.Get(ip)
+// }
