@@ -234,7 +234,33 @@ var (
 			updateF := func(oldD *appsv1.Deployment) {
 				oldD.Spec = d.Spec
 			}
-			_, err := createOrUpdate[appsv1.Deployment](ctx, kubeClient, cfg.namespace, d, updateF)
+			// Get all proxy ConfigMaps and mount them
+			cmList := &corev1.ConfigMapList{}
+			sel, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"component": "proxies"}})
+			if err != nil {
+				return fmt.Errorf("error creating label selector: %w", err)
+			}
+			if err := kubeClient.List(ctx, cmList, &client.ListOptions{LabelSelector: sel}); err != nil {
+				return fmt.Errorf("error listing ConfigMaps: %w", err)
+			}
+			for _, cm := range cmList.Items {
+				volume := corev1.Volume{
+					Name: cm.Name,
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: cm.Name},
+						},
+					},
+				}
+				volumeMount := corev1.VolumeMount{
+					Name:      cm.Name,
+					MountPath: fmt.Sprintf("/services/%s", cm.Name),
+					ReadOnly:  true,
+				}
+				d.Spec.Template.Spec.Volumes = append(d.Spec.Template.Spec.Volumes, volume)
+				d.Spec.Template.Spec.Containers[0].VolumeMounts = append(d.Spec.Template.Spec.Containers[0].VolumeMounts, volumeMount)
+			}
+			_, err = createOrUpdate[appsv1.Deployment](ctx, kubeClient, cfg.namespace, d, updateF)
 			return err
 		},
 	}

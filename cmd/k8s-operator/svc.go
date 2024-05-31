@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gaissmai/bart"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,11 +24,12 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	kube "tailscale.com/k8s-operator"
+	kubeutils "tailscale.com/k8s-operator"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/net/dns/resolvconffile"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 )
 
@@ -95,13 +97,6 @@ func (a *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	} else if err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to get svc: %w", err)
 	}
-	targetIP := tailnetTargetAnnotation(svc)
-	targetFQDN := svc.Annotations[AnnotationTailnetTargetFQDN]
-	if !svc.DeletionTimestamp.IsZero() || !a.shouldExpose(svc) && targetIP == "" && targetFQDN == "" {
-		logger.Debugf("service is being deleted or is (no longer) referring to Tailscale ingress/egress, ensuring any created resources are cleaned up")
-		return reconcile.Result{}, a.maybeCleanup(ctx, logger, svc)
-	}
-
 	return reconcile.Result{}, a.maybeProvision(ctx, logger, svc)
 }
 
@@ -174,72 +169,68 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		logger.Info("got %d ClusterConfigs", len(ccl.Items))
 		return nil
 	}
-	cc := ccl.Items[0]
-
-	cm := &corev1.ConfigMap{}
-	if err := a.Get(ctx, types.NamespacedName{Namespace: a.tsNamespace, Name: "servicerecords"}, cm); err != nil {
-		return fmt.Errorf("error getting serviceRecords ConfigMap: %w", err)
-	}
-	// determine DNS name
-	svcDNSName := dnsNameForSvc(svc, cc.Spec.Domain)
-
-	// serviceRecords := &kube.Records{Version: kube.Alpha1Version}
-
-	// TODO: don't do any of this, the operator will just distribute the destinations.
-	// Containerboot itself will allocate a client -> address pair for each endpoint
-	var serviceRecords *kube.Records
-	if serviceRecordsB := cm.BinaryData["servicerecords.json"]; len(serviceRecordsB) == 0 {
-		serviceRecords = &kube.Records{Version: kube.Alpha1Version}
-	} else {
-		if err := json.Unmarshal(cm.BinaryData["servicerecords.json"], serviceRecords); err != nil {
-			return fmt.Errorf("error unmarshalling service records: %w", err)
-		}
-	}
-
-	if ip, ok := serviceRecords.IP4[svcDNSName]; ok {
-		logger.Infof("Record for %s found with an IP address %s", svcDNSName, ip)
+	if svc.Spec.ClusterIP == "" {
+		logger.Info("[unexpected] Service has no ClusterIP")
 		return nil
 	}
 
-	// for this prototype, only look at the default class
-	// var defaultClass tsapi.Class
-	// for _, class := range cc.Spec.Classes {
-	// 	if class.Name == "default" {
-	// 		defaultClass = class
-	// 		break
-	// 	}
-	// }
-	// var v4Prefixes []netip.Prefix
-	// for _, s := range strings.Split(defaultClass.CIDRv4, ",") {
-	// 	p := netip.MustParsePrefix(strings.TrimSpace(s))
-	// 	if p.Masked() != p {
-	// 		log.Fatalf("v4 prefix %v is not a masked prefix", p)
-	// 	}
-	// 	v4Prefixes = append(v4Prefixes, p)
-	// }
-	// if len(v4Prefixes) == 0 {
-	// 	log.Fatalf("no v4 prefixes specified")
-	// }
+	cc := ccl.Items[0]
+	svcDNSName := a.fqdnsForSvc(svc, cc.Spec.Domain)
+	logger.Debugf("determined DNS name %s", svcDNSName)
 
-	// convert the DNS address
-	// it should have been written by the proxies reconciler
-	// dnsAddr, err := netip.ParseAddr(serviceRecords.DNSAddr)
-	// if err != nil {
-	// 	return fmt.Errorf("error parsing DNS address %s: %w", serviceRecords.DNSAddr, err)
-	// }
+	// Get all ConfigMaps for all proxies
+	cmList := &corev1.ConfigMapList{}
+	if err := a.List(ctx, cmList); err != nil {
+		return fmt.Errorf("error listing proxy ConfigMaps: %w", err)
+	}
+	for _, cm := range cmList.Items {
+		pcB := cm.BinaryData["proxyConfig"]
+		if len(pcB) == 0 {
+			a.logger.Info("[unexpected] ConfigMap %s does not contain proxyConfig", cm.Name)
+			continue
+		}
+		pc := &kubeutils.ProxyConfig{}
+		if err := json.Unmarshal(pcB, pc); err != nil {
+			return fmt.Errorf("error unmarshalling proxyconfig for proxy %s: %w", cm.Name, err)
+		}
+		// does it have the service name already?
+		if _, ok := pc.Services[svcDNSName]; ok {
+			logger.Debugf("service %s already configured for proxy %s; do nothing", svcDNSName, cm.Name)
+			// TODO: check if the record is correct
+			continue
+		}
 
-	// ip := unusedIPv4(v4Prefixes, *serviceRecords, dnsAddr)
-
-	// now write the IP to the configmap
-	// serviceRecords.AddrsToDomain.Insert(netip.PrefixFrom(ip, ip.BitLen()), svcDNSName)
-	// serviceRecords.IP4[svcDNSName] = []string{ip.String()}
-
-	// serviceRecordsB, err := json.Marshal(serviceRecords)
-	// if err != nil {
-	// 	return fmt.Errorf("error marshalling serviceRecords: %w", err)
-	// }
-	// cm.BinaryData["serviceRecords"] = serviceRecordsB
-	return a.Update(ctx, cm)
+		// pick an IP
+		ip := unusedIPv4(pc.ServicesCIDRRange, pc.AddrsToDomain)
+		if pc.AddrsToDomain == nil {
+			pc.AddrsToDomain = &bart.Table[string]{}
+		}
+		pc.AddrsToDomain.Insert(netip.PrefixFrom(ip, ip.BitLen()), svcDNSName)
+		clusterIP, err := netip.ParseAddr(svc.Spec.ClusterIP)
+		if err != nil {
+			return fmt.Errorf("error marshalling Service Cluster IP %v: %w", svc.Spec.ClusterIP, err)
+		}
+		svcConfig := kubeutils.Service{
+			V4ServiceIPs: []netip.Addr{ip},
+			FQDN:         svcDNSName,
+			Ingress: &kubeutils.Ingress{
+				Type:       "tcp", // currently unused
+				V4Backends: []netip.Addr{clusterIP},
+			},
+		}
+		logger.Info("assigning Service IP %v to %s", ip, svcDNSName)
+		mak.Set(&pc.Services, svcDNSName, svcConfig)
+		pcB, err = json.Marshal(pc)
+		if err != nil {
+			return fmt.Errorf("error marshalling ConfigMap for proxy %s: %w", cm.Name, err)
+		}
+		mak.Set(&cm.BinaryData, "proxyConfig", pcB)
+		if err := a.Update(ctx, &cm); err != nil {
+			return fmt.Errorf("error updating ConfigMap %s: %w", cm.Name, err)
+		}
+		logger.Info("ConfigMap %s updated with a record for %s", cm.Name, svcDNSName)
+	}
+	return nil
 }
 
 func validateService(svc *corev1.Service) []string {
@@ -268,6 +259,12 @@ func (a *ServiceReconciler) shouldExposeClusterIP(svc *corev1.Service) bool {
 		return false
 	}
 	return isTailscaleLoadBalancerService(svc, a.isDefaultLoadBalancer) || hasExposeAnnotation(svc)
+}
+func (a *ServiceReconciler) fqdnsForSvc(svc *corev1.Service, clusterDomain string) string {
+	if annot := svc.Annotations["tailscale.com/svc-name"]; annot != "" {
+		return annot + "." + clusterDomain
+	}
+	return svc.Name + "-" + svc.Namespace + "." + clusterDomain
 }
 
 func isTailscaleLoadBalancerService(svc *corev1.Service, isDefaultLoadBalancer bool) bool {
@@ -357,28 +354,22 @@ func clusterDomainFromResolverConf(conf *resolvconffile.Config, namespace string
 	return probablyClusterDomain
 }
 
-func dnsNameForSvc(svc *corev1.Service, clusterDomain string) string {
-	if a := svc.Annotations["tailscale.com/service-dns-name"]; a != "" {
-		return a + "." + clusterDomain
+func unusedIPv4(serviceCIDR netip.Prefix, usedIPs *bart.Table[string]) netip.Addr {
+	ip := randV4(serviceCIDR)
+	if usedIPs == nil {
+		return ip // first IP being assigned
 	}
-	return svc.Name + "-" + svc.Namespace + "." + clusterDomain
-}
-
-func unusedIPv4(serviceCIDR []netip.Prefix, serviceRecords kube.Records, dnsAddr netip.Addr) netip.Addr {
-	for _, r := range serviceCIDR {
-		ip := randV4(r)
-		for r.Contains(ip) {
-			if !isIPUsed(ip, serviceRecords) && ip != dnsAddr {
-				return ip
-			}
-			ip = ip.Next()
+	for serviceCIDR.Contains(ip) {
+		if !isIPUsed(ip, usedIPs) {
+			return ip
 		}
+		ip = ip.Next()
 	}
 	return netip.Addr{}
 }
 
-func isIPUsed(ip netip.Addr, serviceRecords kube.Records) bool {
-	_, ok := serviceRecords.AddrsToDomain.Get(ip)
+func isIPUsed(ip netip.Addr, usedIPs *bart.Table[string]) bool {
+	_, ok := usedIPs.Get(ip)
 	return ok
 }
 

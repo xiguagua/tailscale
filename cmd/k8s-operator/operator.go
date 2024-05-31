@@ -40,6 +40,7 @@ import (
 	"tailscale.com/ipn/store/kubestore"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/tsnet"
+	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
 	"tailscale.com/version"
 )
@@ -246,11 +247,11 @@ func runReconcilers(opts reconcilerOpts) {
 		startlog.Fatalf("could not create manager: %v", err)
 	}
 
-	// svcFilter := handler.EnqueueRequestsFromMapFunc(serviceHandler)
-	// svcChildFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("svc"))
-	// // If a ProxyClass changes, enqueue all Services labeled with that
-	// // ProxyClass's name.
-	// proxyClassFilterForSvc := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForSvc(mgr.GetClient(), startlog))
+	svcFilter := handler.EnqueueRequestsFromMapFunc(serviceHandler)
+	svcChildFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("svc"))
+	// If a ProxyClass changes, enqueue all Services labeled with that
+	// ProxyClass's name.
+	proxyClassFilterForSvc := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForSvc(mgr.GetClient(), startlog))
 
 	eventRecorder := mgr.GetEventRecorderFor("tailscale-operator")
 	ssr := &tailscaleSTSReconciler{
@@ -263,24 +264,24 @@ func runReconcilers(opts reconcilerOpts) {
 		proxyPriorityClassName: opts.proxyPriorityClassName,
 		tsFirewallMode:         opts.proxyFirewallMode,
 	}
-	// err = builder.
-	// 	ControllerManagedBy(mgr).
-	// 	Named("service-reconciler").
-	// 	Watches(&corev1.Service{}, svcFilter).
-	// 	Watches(&appsv1.StatefulSet{}, svcChildFilter).
-	// 	Watches(&corev1.Secret{}, svcChildFilter).
-	// 	Watches(&tsapi.ProxyClass{}, proxyClassFilterForSvc).
-	// 	Complete(&ServiceReconciler{
-	// 		ssr:                   ssr,
-	// 		Client:                mgr.GetClient(),
-	// 		logger:                opts.log.Named("service-reconciler"),
-	// 		isDefaultLoadBalancer: opts.proxyActAsDefaultLoadBalancer,
-	// 		recorder:              eventRecorder,
-	// 		tsNamespace:           opts.tailscaleNamespace,
-	// 	})
-	// if err != nil {
-	// 	startlog.Fatalf("could not create service reconciler: %v", err)
-	// }
+	err = builder.
+		ControllerManagedBy(mgr).
+		Named("service-reconciler").
+		Watches(&corev1.Service{}, svcFilter).
+		Watches(&appsv1.StatefulSet{}, svcChildFilter).
+		Watches(&corev1.Secret{}, svcChildFilter).
+		Watches(&tsapi.ProxyClass{}, proxyClassFilterForSvc).
+		Complete(&ServiceReconciler{
+			ssr:                   ssr,
+			Client:                mgr.GetClient(),
+			logger:                opts.log.Named("service-reconciler"),
+			isDefaultLoadBalancer: opts.proxyActAsDefaultLoadBalancer,
+			recorder:              eventRecorder,
+			tsNamespace:           opts.tailscaleNamespace,
+		})
+	if err != nil {
+		startlog.Fatalf("could not create service reconciler: %v", err)
+	}
 	err = builder.
 		ControllerManagedBy(mgr).
 		Named("proxies-reconciler").
@@ -340,23 +341,24 @@ func runReconcilers(opts reconcilerOpts) {
 	// TODO (irbekrm): switch to metadata-only watches for resources whose
 	// spec we don't need to inspect to reduce memory consumption.
 	// https://github.com/kubernetes-sigs/controller-runtime/issues/1159
-	// nameserverFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("nameserver"))
-	// err = builder.ControllerManagedBy(mgr).
-	// 	For(&tsapi.DNSConfig{}).
-	// 	Watches(&appsv1.Deployment{}, nameserverFilter).
-	// 	Watches(&corev1.ConfigMap{}, nameserverFilter).
-	// 	Watches(&corev1.Service{}, nameserverFilter).
-	// 	Watches(&corev1.ServiceAccount{}, nameserverFilter).
-	// 	Complete(&NameserverReconciler{
-	// 		recorder:    eventRecorder,
-	// 		tsNamespace: opts.tailscaleNamespace,
-	// 		Client:      mgr.GetClient(),
-	// 		logger:      opts.log.Named("nameserver-reconciler"),
-	// 		clock:       tstime.DefaultClock{},
-	// 	})
-	// if err != nil {
-	// 	startlog.Fatalf("could not create nameserver reconciler: %v", err)
-	// }
+	// TODO: watch for proxy config ConfigMap change events
+	nameserverFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("nameserver"))
+	err = builder.ControllerManagedBy(mgr).
+		For(&tsapi.DNSConfig{}).
+		Watches(&appsv1.Deployment{}, nameserverFilter).
+		Watches(&corev1.ConfigMap{}, nameserverFilter).
+		Watches(&corev1.Service{}, nameserverFilter).
+		Watches(&corev1.ServiceAccount{}, nameserverFilter).
+		Complete(&NameserverReconciler{
+			recorder:    eventRecorder,
+			tsNamespace: opts.tailscaleNamespace,
+			Client:      mgr.GetClient(),
+			logger:      opts.log.Named("nameserver-reconciler"),
+			clock:       tstime.DefaultClock{},
+		})
+	if err != nil {
+		startlog.Fatalf("could not create nameserver reconciler: %v", err)
+	}
 	// err = builder.ControllerManagedBy(mgr).
 	// 	For(&tsapi.ProxyClass{}).
 	// 	Complete(&ProxyClassReconciler{

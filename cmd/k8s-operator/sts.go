@@ -198,7 +198,7 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 		if err != nil {
 			return fmt.Errorf("failed to create or get API key secret: %w", err)
 		}
-		_, err = a.createOrGetCM(ctx, logger, sts, i)
+		_, err = a.createOrGetCM(ctx, logger, sts, i, cidr)
 		if err != nil {
 			return fmt.Errorf("failed to create or get services ConfigMap: %w", err)
 		}
@@ -318,23 +318,32 @@ func (a *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, l
 	logger.Debugf("reconciling headless service for StatefulSet", "namebase", nameBase)
 	return createOrUpdate(ctx, a.Client, a.operatorNamespace, hsvc, func(svc *corev1.Service) { svc.Spec = hsvc.Spec })
 }
-func (a *tailscaleSTSReconciler) createOrGetCM(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, i int) (string, error) {
+func (a *tailscaleSTSReconciler) createOrGetCM(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, i int, cidr netip.Prefix) (string, error) {
 	hostname := fmt.Sprintf("%s-%d", stsC.name, i)
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            hostname,
 			Namespace:       a.operatorNamespace,
-			Labels:          map[string]string{"proxy-index": hostname, "proxies": stsC.name},
+			Labels:          map[string]string{"proxy-index": hostname, "proxies": stsC.name, "component": "proxies"},
 			OwnerReferences: []metav1.OwnerReference{*stsC.clusterConfOwnerRef},
 		},
 	}
 	if err := a.Get(ctx, client.ObjectKeyFromObject(cm), cm); apierrors.IsNotFound(err) {
+		proxyConfig := &kubeutils.ProxyConfig{
+			ServicesCIDRRange: cidr,
+		}
+		proxyConfigBytes, err := json.Marshal(proxyConfig)
+		if err != nil {
+			return "", fmt.Errorf("error marshalling config for proxy %s: %w", hostname, err)
+		}
+		mak.Set(&cm.BinaryData, "proxyConfig", proxyConfigBytes)
 		logger.Infof("creating services ConfigMap %s", hostname)
-		createErr := a.Create(ctx, cm)
-		return hostname, createErr
+		return hostname, a.Create(ctx, cm)
 	} else if err != nil {
 		return "", fmt.Errorf("error getting ConfigMap %s", hostname)
 	}
+	// For this prototype, the Services CIDR written to the ConfigMap is
+	// never updated.
 	return hostname, nil
 }
 
@@ -550,9 +559,8 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 			Value: "/etc/tsconfig/$(POD_NAME)",
 		},
 		corev1.EnvVar{
-			// New style is in the form of cap-<capability-version>.hujson.
-			Name:  "TS_EXPERIMENTAL_SERVICES_CONFIG",
-			Value: "/etc/services/$(POD_NAME)",
+			Name:  "TS_EXPERIMENTAL_SERVICES_CONFIG_PATH",
+			Value: "/etc/$(POD_NAME)",
 		},
 	)
 
@@ -588,8 +596,7 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
 			Name:      fmt.Sprintf("servicesconfig-%d", i),
 			ReadOnly:  true,
-			MountPath: fmt.Sprintf("/etc/services-%d/", i),
-			// SubPath:   fmt.Sprintf("%s-%d", sts.name, i),
+			MountPath: fmt.Sprintf("/etc/%s-%d", sts.name, i),
 		})
 	}
 

@@ -52,9 +52,7 @@ func (pr *proxiesReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, fmt.Errorf("error provision proxy: %w", err)
 	}
 	// logger.Debugf("finished reconciling index %d ", i)
-
 	// Now watch for Secret changes, pull out device info and update cluster config status
-
 	return reconcile.Result{}, nil
 
 	// // build opts

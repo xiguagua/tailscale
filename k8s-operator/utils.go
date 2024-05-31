@@ -7,6 +7,7 @@ package kube
 
 import (
 	"fmt"
+	"net/netip"
 
 	"github.com/gaissmai/bart"
 	"tailscale.com/tailcfg"
@@ -60,13 +61,24 @@ func CapVerFromFileName(name string) (tailcfg.CapabilityVersion, error) {
 	return cap, err
 }
 
+type ProxyConfig struct {
+	// Maybe we don't need to put this one here- it's just convenient for
+	// the services reconciler to read it from here.
+	ServicesCIDRRange netip.Prefix       `json:"serviceCIDR,omitempty"`
+	Services          map[string]Service `json:"services,omitempty"`
+
+	// For lookup convenience
+	AddrsToDomain *bart.Table[string] `json:"addrsToDomain,omitempty"`
+}
+
 type Service struct {
-	V4ServiceIPs string   `json:"vService4ips"`
-	FQDN         string   `json:"fqdn"`
-	Ingress      *Ingress `json:"ingress"`
+	FQDN         string       `json:"fqdn,omitempty"`
+	V4ServiceIPs []netip.Addr `json:"vService4ips"`
+	Ingress      *Ingress     `json:"ingress"`
 }
 
 type Ingress struct {
-	Type       string   `json:"type"` // tcp or http
-	V4Backends []string `json:"v4Backends"`
+	Type string `json:"type"` // tcp or http
+	// type?
+	V4Backends []netip.Addr `json:"v4Backends"`
 }

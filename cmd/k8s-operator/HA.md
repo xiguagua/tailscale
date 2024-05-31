@@ -17,7 +17,11 @@ Separate ConfigMap for each proxy replica, each replica gets mounted all of them
 
 ^ And those seem to persist even when --accept-routes is off on the client- because these are CGNAT?
 
-v0.0.3proxycidr - current operator tag
+v0.0.14proxycidr - current operator tag
+v0.0.15proxycidr - proxy tags
+
+need to --accept-routes on client for this to work
+TODO: can we bypass that?
 
 next steps:
 - when a new ingress Service exposed, update service ConfigMaps
