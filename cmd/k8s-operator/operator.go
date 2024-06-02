@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -238,6 +239,8 @@ func runReconcilers(opts reconcilerOpts) {
 				&appsv1.StatefulSet{}:        nsFilter,
 				&appsv1.Deployment{}:         nsFilter,
 				&discoveryv1.EndpointSlice{}: nsFilter,
+				&rbacv1.Role{}:               nsFilter,
+				&rbacv1.RoleBinding{}:        nsFilter,
 			},
 		},
 		Scheme: tsapi.GlobalScheme,
@@ -352,9 +355,11 @@ func runReconcilers(opts reconcilerOpts) {
 		Complete(&NameserverReconciler{
 			recorder:    eventRecorder,
 			tsNamespace: opts.tailscaleNamespace,
+			tsClient:    opts.tsClient,
 			Client:      mgr.GetClient(),
 			logger:      opts.log.Named("nameserver-reconciler"),
 			clock:       tstime.DefaultClock{},
+			defaultTags: strings.Split(opts.proxyTags, ","),
 		})
 	if err != nil {
 		startlog.Fatalf("could not create nameserver reconciler: %v", err)

@@ -5,4 +5,4 @@ kind: ClusterConfig
 metadata:
   name: proxies
 spec:
-  domain: "foo.tailbd97a.ts.net." # must have the dot at the moment
+  domain: "foo.bar." # must have the dot at the moment

@@ -6,4 +6,4 @@ spec:
   nameserver:
     image:
       repo: gcr.io/csi-test-290908/nameserver
-      tag: v0.0.20proxycidr
+      tag: v0.0.23proxycidr
