@@ -384,6 +384,24 @@ func runReconcilers(opts reconcilerOpts) {
 	if err != nil {
 		startlog.Fatalf("could not create DNS records reconciler: %v", err)
 	}
+
+	// TSRecorder reconciler.
+	tsRecorderFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("tsrecorder"))
+	err = builder.ControllerManagedBy(mgr).
+		For(&tsapi.TSRecorder{}).
+		Watches(&appsv1.StatefulSet{}, tsRecorderFilter).
+		Watches(&corev1.Secret{}, tsRecorderFilter).
+		Complete(&TSRecorderReconciler{
+			recorder:    eventRecorder,
+			tsNamespace: opts.tailscaleNamespace,
+			Client:      mgr.GetClient(),
+			logger:      opts.log.Named("nameserver-reconciler"),
+			clock:       tstime.DefaultClock{},
+		})
+	if err != nil {
+		startlog.Fatalf("could not create nameserver reconciler: %v", err)
+	}
+
 	startlog.Infof("Startup complete, operator running, version: %s", version.Long())
 	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
 		startlog.Fatalf("could not start manager: %v", err)
