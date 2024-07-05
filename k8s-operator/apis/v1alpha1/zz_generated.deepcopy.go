@@ -670,6 +670,21 @@ func (in *TSRecorderSpec) DeepCopyInto(out *TSRecorderSpec) {
 		*out = make(Tags, len(*in))
 		copy(*out, *in)
 	}
+	out.Image = in.Image
+	if in.ExtraVolumes != nil {
+		in, out := &in.ExtraVolumes, &out.ExtraVolumes
+		*out = make([]corev1.Volume, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+	if in.ExtraVolumeMounts != nil {
+		in, out := &in.ExtraVolumeMounts, &out.ExtraVolumeMounts
+		*out = make([]corev1.VolumeMount, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	out.Backends = in.Backends
 }
 

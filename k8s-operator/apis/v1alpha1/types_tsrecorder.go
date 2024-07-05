@@ -6,6 +6,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -69,15 +70,17 @@ type TSRecorderSpec struct {
 	// start or end with a dash and must be between 2 and 63 characters long.
 	// +optional
 	Hostname Hostname `json:"hostname,omitempty"`
-	// ProxyClass is the name of the ProxyClass custom resource that
-	// contains configuration options that should be applied to the
-	// resources created for this TSRecorder. If unset, the operator will
-	// create resources with the default configuration.
-	// +optional
-	ProxyClass string `json:"proxyClass,omitempty"`
+
+	Image Image `json:"image,omitempty"`
 
 	// EnableUI switches on the UI for the recorder instance.
 	EnableUI bool `json:"enableUI,omitempty"`
+
+	Replicas int32 `json:"replicas,omitempty"`
+
+	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
+
+	ExtraVolumeMounts []corev1.VolumeMount `json:"extraVolumeMounts,omitempty"`
 
 	Backends Backends `json:"backends"`
 	//   backends:

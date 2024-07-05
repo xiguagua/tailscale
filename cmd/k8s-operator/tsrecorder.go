@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	xslices "golang.org/x/exp/slices"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,6 +21,7 @@ import (
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/tstime"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/set"
 )
@@ -37,7 +39,6 @@ var gaugeTSRecorderResources = clientmetric.NewGauge("k8s_tsrecorder_resources")
 type TSRecorderReconciler struct {
 	client.Client
 	logger      *zap.SugaredLogger
-	ssr         *tailscaleSTSReconciler
 	recorder    record.EventRecorder
 	clock       tstime.Clock
 	tsNamespace string
@@ -67,7 +68,7 @@ func (r *TSRecorderReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			return reconcile.Result{}, nil
 		}
 
-		if done, err := r.maybeCleanupTSRecorder(ctx, logger, tsr); err != nil {
+		if done, err := r.maybeCleanup(ctx, logger, tsr); err != nil {
 			return reconcile.Result{}, err
 		} else if !done {
 			logger.Debugf("TSRecorder resource cleanup not yet finished, will retry...")
@@ -114,7 +115,7 @@ func (r *TSRecorderReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		return setStatus(tsr, tsapi.TSRecorderReady, metav1.ConditionFalse, reasonTSRecorderInvalid, message)
 	}
 
-	if err = r.maybeProvisionTSRecorder(ctx, logger, tsr); err != nil {
+	if err = r.maybeProvision(ctx, logger, tsr); err != nil {
 		logger.Errorf("error creating TSRecorder resources: %w", err)
 		message := fmt.Sprintf("failed creating TSRecorder: %s", err)
 		r.recorder.Eventf(tsr, corev1.EventTypeWarning, reasonTSRecorderCreationFailed, message)
@@ -125,7 +126,7 @@ func (r *TSRecorderReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	return setStatus(tsr, tsapi.TSRecorderReady, metav1.ConditionTrue, reasonTSRecorderCreated, reasonTSRecorderCreated)
 }
 
-func (r *TSRecorderReconciler) maybeProvisionTSRecorder(ctx context.Context, logger *zap.SugaredLogger, tsr *tsapi.TSRecorder) error {
+func (r *TSRecorderReconciler) maybeProvision(ctx context.Context, logger *zap.SugaredLogger, tsr *tsapi.TSRecorder) error {
 	hostname := tsr.Name + "-tsrecorder"
 	if tsr.Spec.Hostname != "" {
 		hostname = string(tsr.Spec.Hostname)
@@ -145,8 +146,12 @@ func (r *TSRecorderReconciler) maybeProvisionTSRecorder(ctx context.Context, log
 	gaugeTSRecorderResources.Set(int64(r.tsRecorders.Len()))
 	r.mu.Unlock()
 
-	_, err := r.ssr.Provision(ctx, logger, sts)
-	if err != nil {
+	depl := statefulSet(tsr)
+	if _, err := createOrUpdate(ctx, r.Client, tsr.Namespace, &depl, func(d *appsv1.Deployment) {
+		d.ObjectMeta.Labels = depl.ObjectMeta.Labels
+		d.ObjectMeta.Annotations = depl.ObjectMeta.Annotations
+		d.Spec = depl.Spec
+	}); err != nil {
 		return err
 	}
 
@@ -169,7 +174,7 @@ func (r *TSRecorderReconciler) maybeProvisionTSRecorder(ctx context.Context, log
 	return nil
 }
 
-func (r *TSRecorderReconciler) maybeCleanupTSRecorder(ctx context.Context, logger *zap.SugaredLogger, tsr *tsapi.TSRecorder) (bool, error) {
+func (r *TSRecorderReconciler) maybeCleanup(ctx context.Context, logger *zap.SugaredLogger, tsr *tsapi.TSRecorder) (bool, error) {
 	if done, err := r.ssr.Cleanup(ctx, logger, childResourceLabels(tsr.Name, r.tsNamespace, "tsrecorder")); err != nil {
 		return false, fmt.Errorf("failed to cleanup TSRecorder resources: %w", err)
 	} else if !done {
@@ -195,4 +200,119 @@ func (r *TSRecorderReconciler) validate(_ *tsapi.TSRecorder) error {
 
 func markedForDeletion(tsr *tsapi.TSRecorder) bool {
 	return !tsr.DeletionTimestamp.IsZero()
+}
+
+func statefulSet(tsr *tsapi.TSRecorder) appsv1.StatefulSet {
+	return appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            tsr.Name,
+			Namespace:       tsr.Namespace,
+			Labels:          labels("tsrecorder", tsr.Name),
+			Annotations:     nil, // TODO
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(tsr, tsapi.SchemeGroupVersion.WithKind("TSRecorder"))},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: ptr.To[int32](tsr.Spec.Replicas),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels("tsrecorder", tsr.Name),
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        tsr.Name,
+					Namespace:   tsr.Namespace,
+					Labels:      labels("tsrecorder", tsr.Name),
+					Annotations: nil, // TODO
+				},
+				Spec: corev1.PodSpec{
+					// TODO: security context, image pull secrets, resources, others?
+					ServiceAccountName: tsr.Name,
+					Containers: []corev1.Container{
+						{
+							// TODO: extra env, resources, probes, others?
+							Name: "tsrecorder",
+							Image: func() string {
+								repo, tag := tsr.Spec.Image.Repo, tsr.Spec.Image.Tag
+								if repo == "" {
+									repo = "tailscale/tsrecorder"
+								}
+								if tag == "" {
+									tag = "stable"
+								}
+								return fmt.Sprintf("%s:%s", repo, tag)
+							}(),
+							Env: []corev1.EnvVar{ // TODO: deploy and use a secret
+								{
+									Name: "TS_AUTHKEY",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "recorder",
+											},
+											Key: "key",
+										},
+									},
+								},
+								{
+									Name: "TS_KUBE_SECRET",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											// Secret is named after the pod.
+											FieldPath: "metadata.name",
+										},
+									},
+								},
+							},
+							Args: func() []string {
+								args := []string{
+									"--statedir=/data/state",
+								}
+								if tsr.Spec.Backends.Disk.Path != "" {
+									args = append(args, "--dst="+tsr.Spec.Backends.Disk.Path)
+								}
+								if tsr.Spec.EnableUI {
+									args = append(args, "--ui")
+								}
+								return args
+							}(),
+							VolumeMounts: append([]corev1.VolumeMount{
+								{
+									Name:      "data",
+									MountPath: "/data",
+									ReadOnly:  false,
+								},
+							}, tsr.Spec.ExtraVolumeMounts...),
+						},
+					},
+					Volumes: append([]corev1.Volume{
+						{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					}, tsr.Spec.ExtraVolumes...),
+				},
+			},
+		},
+	}
+}
+
+func sa(tsr *tsapi.TSRecorder) corev1.ServiceAccount {
+	return corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            tsr.Name,
+			Namespace:       tsr.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(tsr, tsapi.SchemeGroupVersion.WithKind("TSRecorder"))},
+			Labels:          labels("tsrecorder", tsr.Name),
+		},
+	}
+}
+
+func labels(app, instance string) map[string]string {
+	// ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/
+	return map[string]string{
+		"app.kubernetes.io/name":       app,
+		"app.kubernetes.io/instance":   instance,
+		"app.kubernetes.io/managed-by": "tailscale.com/operator",
+	}
 }
