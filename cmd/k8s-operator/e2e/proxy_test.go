@@ -12,6 +12,7 @@ import (
 	"golang.org/x/oauth2/clientcredentials"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -120,18 +121,18 @@ func TestProxy(t *testing.T) {
 		ObjectMeta: objectMeta("tailscale", "read-secrets"),
 		Subjects: []rbacv1.Subject{{
 			Kind: "Group",
-			Name: "ts:test-proxy",
+			Name: "ts:e2e-test-proxy",
 		}},
 		RoleRef: rbacv1.RoleRef{
 			Kind: "Role",
-			Name: "read-secret",
+			Name: "read-secrets",
 		},
 	})
 
 	// Make proxy kube config that impersonates a user through operator proxy.
 	proxyCfg := &rest.Config{
-		Host:      fmt.Sprintf("%s:443", hostNameFromOperatorSecret(t, operatorSecret)),
-		Transport: ts.HTTPClient().Transport,
+		Host: fmt.Sprintf("https://%s:443", hostNameFromOperatorSecret(t, operatorSecret)),
+		Dial: ts.Dial,
 	}
 	proxyCl, err := client.New(proxyCfg, client.Options{})
 	if err != nil {
@@ -150,8 +151,8 @@ func TestProxy(t *testing.T) {
 	forbiddenSecret := corev1.Secret{
 		ObjectMeta: objectMeta("default", "operator"),
 	}
-	if err := get(ctx, proxyCl, &forbiddenSecret); err == nil {
-		t.Fatal("expected error fetching secret from default namespace")
+	if err := get(ctx, proxyCl, &forbiddenSecret); err == nil || !apierrors.IsForbidden(err) {
+		t.Fatalf("expected forbidden error fetching secret from default namespace: %s", err)
 	}
 }
 
