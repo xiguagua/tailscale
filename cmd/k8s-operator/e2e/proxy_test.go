@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/oauth2/clientcredentials"
 	corev1 "k8s.io/api/core/v1"
@@ -30,85 +29,14 @@ import (
 // - OAuth client ID and secret in TS_API_CLIENT_ID and TS_API_CLIENT_SECRET env
 // - OAuth client must have device write for tag:e2e-test-proxy tag
 func TestProxy(t *testing.T) {
-	start := time.Now()
 	ctx := context.Background()
 	cfg := config.GetConfigOrDie()
 	cl, err := client.New(cfg, client.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Connect to tailnet with test-specific tag so we trigger some
-	// preconfigured ACLs when connecting to the API server proxy:
-	// "grants": [{
-	// 	 "src": ["tag:e2e-test-proxy"],
-	// 	 "dst": ["tag:k8s-operator"],
-	// 	 "app": {
-	//     "tailscale.com/cap/kubernetes": [{
-	//       "impersonate": {
-	//         "groups": ["ts:e2e-test-proxy"],
-	//       }
-	//     }]
-	//   }
-	// }]
 
-	credentials := clientcredentials.Config{
-		ClientID:     os.Getenv("TS_API_CLIENT_ID"),
-		ClientSecret: os.Getenv("TS_API_CLIENT_SECRET"),
-		TokenURL:     "https://login.tailscale.com/api/v2/oauth/token",
-		Scopes:       []string{"device"}, // TODO: Add acl scope and ensure ACLs as part of test
-	}
-	tsClient := tailscale.NewClient("-", nil)
-	tsClient.HTTPClient = credentials.Client(context.Background())
-
-	caps := tailscale.KeyCapabilities{
-		Devices: tailscale.KeyDeviceCapabilities{
-			Create: tailscale.KeyDeviceCreateCapabilities{
-				Reusable:      false,
-				Preauthorized: true,
-				Ephemeral:     true,
-				Tags:          []string{"tag:e2e-test-proxy"},
-			},
-		},
-	}
-
-	tailscale.I_Acknowledge_This_API_Is_Unstable = true
-	authKey, authKeyMeta, err := tsClient.CreateKey(ctx, caps)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := tsClient.DeleteKey(ctx, authKeyMeta.ID); err != nil {
-			t.Errorf("error deleting auth key: %s", err)
-		}
-	})
-	t.Logf("%.1fs created auth key", time.Since(start).Seconds())
-
-	ts := &tsnet.Server{
-		Hostname:  "test-proxy",
-		Ephemeral: true,
-		Dir:       t.TempDir(),
-		AuthKey:   authKey,
-	}
-	_, err = ts.Up(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := ts.Close(); err != nil {
-			t.Errorf("error shutting down tsnet.Server: %s", err)
-		}
-	})
-	t.Logf("%.1fs tsnet.Server started", time.Since(start).Seconds())
-
-	// Get operator host name from kube secret.
-	operatorSecret := corev1.Secret{
-		ObjectMeta: objectMeta("tailscale", "operator"),
-	}
-	if err := get(ctx, cl, &operatorSecret); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create role and role binding to allow a user we'll impersonate to do stuff.
+	// Create role and role binding to allow a group we'll impersonate to do stuff.
 	updateAndCleanup(t, ctx, cl, &rbacv1.Role{
 		ObjectMeta: objectMeta("tailscale", "read-secrets"),
 		Rules: []rbacv1.PolicyRule{{
@@ -129,7 +57,28 @@ func TestProxy(t *testing.T) {
 		},
 	})
 
-	// Make proxy kube config that impersonates a user through operator proxy.
+	// Get operator host name from kube secret.
+	operatorSecret := corev1.Secret{
+		ObjectMeta: objectMeta("tailscale", "operator"),
+	}
+	if err := get(ctx, cl, &operatorSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	// Connect to tailnet with test-specific tag so we trigger some
+	// preconfigured ACLs when connecting to the API server proxy:
+	// "grants": [{
+	// 	 "src": ["tag:e2e-test-proxy"],
+	// 	 "dst": ["tag:k8s-operator"],
+	// 	 "app": {
+	//     "tailscale.com/cap/kubernetes": [{
+	//       "impersonate": {
+	//         "groups": ["ts:e2e-test-proxy"],
+	//       }
+	//     }]
+	//   }
+	// }]
+	ts := tsnetServerWithTag(t, ctx, "tag:e2e-test-proxy")
 	proxyCfg := &rest.Config{
 		Host: fmt.Sprintf("https://%s:443", hostNameFromOperatorSecret(t, operatorSecret)),
 		Dial: ts.Dial,
@@ -154,6 +103,57 @@ func TestProxy(t *testing.T) {
 	if err := get(ctx, proxyCl, &forbiddenSecret); err == nil || !apierrors.IsForbidden(err) {
 		t.Fatalf("expected forbidden error fetching secret from default namespace: %s", err)
 	}
+}
+
+func tsnetServerWithTag(t *testing.T, ctx context.Context, tag string) *tsnet.Server {
+	credentials := clientcredentials.Config{
+		ClientID:     os.Getenv("TS_API_CLIENT_ID"),
+		ClientSecret: os.Getenv("TS_API_CLIENT_SECRET"),
+		TokenURL:     "https://login.tailscale.com/api/v2/oauth/token",
+		Scopes:       []string{"device"}, // TODO: Add acl scope and ensure ACLs as part of function
+	}
+	tsClient := tailscale.NewClient("-", nil)
+	tsClient.HTTPClient = credentials.Client(context.Background())
+
+	caps := tailscale.KeyCapabilities{
+		Devices: tailscale.KeyDeviceCapabilities{
+			Create: tailscale.KeyDeviceCreateCapabilities{
+				Reusable:      false,
+				Preauthorized: true,
+				Ephemeral:     true,
+				Tags:          []string{tag},
+			},
+		},
+	}
+
+	tailscale.I_Acknowledge_This_API_Is_Unstable = true
+	authKey, authKeyMeta, err := tsClient.CreateKey(ctx, caps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := tsClient.DeleteKey(ctx, authKeyMeta.ID); err != nil {
+			t.Errorf("error deleting auth key: %s", err)
+		}
+	})
+
+	ts := &tsnet.Server{
+		Hostname:  "test-proxy",
+		Ephemeral: true,
+		Dir:       t.TempDir(),
+		AuthKey:   authKey,
+	}
+	_, err = ts.Up(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := ts.Close(); err != nil {
+			t.Errorf("error shutting down tsnet.Server: %s", err)
+		}
+	})
+
+	return ts
 }
 
 func hostNameFromOperatorSecret(t *testing.T, s corev1.Secret) string {
