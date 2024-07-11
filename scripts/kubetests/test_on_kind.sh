@@ -11,13 +11,17 @@ set -eu
 # registry (i.e docker) and the kind cluster.
 #
 # Run it with:
-# OAUTH_CLIENT_ID=<oauth client ID> OAUTH_CLIENT_SECRET=<oauth-client-secret> [K8S_VERSION=<k8s version>] ./scripts/kubetests/test_on_kind.sh
+# OAUTH_CLIENT_ID=<oauth client ID> \
+# OAUTH_CLIENT_SECRET=<oauth-client-secret> \
+# [K8S_VERSION=<k8s version>] \
+# [CLUSTER_NAME=<cluster_name] \
+# ./scripts/kubetests/test_on_kind.sh
 
 K8S_VERSION="${K8S_VERSION:=1.30}"
+CLUSTER_NAME="${CLUSTER_NAME:=ts-e2e}"
 
 # Kind recommends to use the exact image SHAs with a given kind build
-
-case  K8S_VERSION in
+case  $K8S_VERSION in
 1.30*) kind_image=kindest/node:v1.30.0@sha256:047357ac0cfea04663786a612ba1eaba9702bef25227a794b52890dd8bcd692e ;;
 1.29*) kind_image=kindest/node:v1.29.4@sha256:3abb816a5b1061fb15c6e9e60856ec40d56b7b52bcea5f5f1350bc6e2320b6f8 ;;
 1.28*) kind_image=kindest/node:v1.28.9@sha256:dca54bc6a6079dd34699d53d7d4ffa2e853e46a20cd12d619a09207e35300bd0 ;;
@@ -27,9 +31,9 @@ case  K8S_VERSION in
 esac
 
 # TODO: check that the cluster does not already exist
-kind create cluster --name kube-e2e --image "${kind_image}"
+kind create cluster --name "${CLUSTER_NAME}" --image "${kind_image}"
 
-KIND="true" OAUTH_CLIENT_ID="${OAUTH_CLIENT_ID}" OAUTH_CLIENT_SECRET="${OAUTH_CLIENT_SECRET}" ./scripts/kubetests/setup.sh
+KIND="${CLUSTER_NAME}" OAUTH_CLIENT_ID="${OAUTH_CLIENT_ID}" OAUTH_CLIENT_SECRET="${OAUTH_CLIENT_SECRET}" ./scripts/kubetests/setup.sh
 
 # TODO: now run the tests
 # go test ./cmd/k8s-operator/e2e/...

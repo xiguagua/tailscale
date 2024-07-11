@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 
-set -eux
+set -eu
+
+# This script builds the latest operator and proxy images and manifests and
+# installs them as well as ingress-nginx chart to the current kube cluster. Run
+# it with KIND=<cluster-name> to upload images to a kind cluster else you must
+# pass REPO env var pointing at a public repository where the images will be
+# pushed.
+# This script is also run from ./scripts/kubetests/test_on_kind.sh
+# Run it with:
+# OAUTH_CLIENT_ID=<oauth client ID> \
+# OAUTH_CLIENT_SECRET=<oauth-client-secret> \
+# [REPO=<image registry>] \
+# [KIND=<kind-cluster-name>] \
+# ./scripts/kubetests/setup.sh
 
 OAUTH_CLIENT_ID="$OAUTH_CLIENT_ID"
 OAUTH_CLIENT_SECRET="$OAUTH_CLIENT_SECRET"
-KIND=${KIND:="false"}
+KIND=${KIND:-}
 
-if [[ "$KIND" == "true" ]]; then
+if [[ ! -z "$KIND" ]]; then
   REPO="tailscale-for-kind"
 fi
 
@@ -18,16 +31,16 @@ args=(TAGS="${VERSION_SHORT}")
 
 make kube-generate-all # ensure things are up to date
 
-if [[ "$KIND" == "true" ]]; then
+if [[ ! -z "$KIND" ]]; then
 args+=" PLATFORM=local"
 fi
 
 make ${args[@]} REPO="${REPO}/proxy" publishdevimage
 make ${args[@]} REPO="${REPO}/operator" publishdevoperator
 
-if [[ "$KIND" == "true" ]]; then
-  kind load docker-image  "${REPO}/operator:${VERSION_SHORT}"
-  kind load docker-image  "${REPO}/proxy:${VERSION_SHORT}"
+if [[ ! -z "$KIND" ]]; then
+  kind load docker-image "${REPO}/operator:${VERSION_SHORT}" --name "${KIND}"
+  kind load docker-image  "${REPO}/proxy:${VERSION_SHORT}" --name "${KIND}"
 fi
 
 kubectl apply -f ./cmd/k8s-operator/deploy/crds/
@@ -56,4 +69,3 @@ helm upgrade --install ingress ingress-nginx/ingress-nginx
 
 # TODO: either wait for the ingress-controller Pod to become ready or do
 # something else to wait for the parts we care about to be ready.
-
