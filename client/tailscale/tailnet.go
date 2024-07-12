@@ -28,7 +28,9 @@ func (c *Client) TailnetDeleteRequest(ctx context.Context, tailnetID string) (er
 		return err
 	}
 
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return err
+	}
 	b, resp, err := c.sendRequest(req)
 	if err != nil {
 		return err

@@ -115,8 +115,7 @@ func tsnetServerWithTag(t *testing.T, ctx context.Context, tag string) *tsnet.Se
 		TokenURL:     "https://login.tailscale.com/api/v2/oauth/token",
 		Scopes:       []string{"devices", "acl"},
 	}
-	tsClient := tailscale.NewClient("-", nil)
-	tsClient.HTTPClient = credentials.Client(ctx)
+	tsClient := tailscale.NewClient("-", tailscale.NewOAuth2AuthMethod(ctx, credentials))
 
 	acls, err := tsClient.ACLHuJSON(ctx)
 	if err != nil {

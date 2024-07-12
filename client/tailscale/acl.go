@@ -319,7 +319,9 @@ func (c *Client) previewACLPostRequest(ctx context.Context, body []byte, preview
 	req.URL.RawQuery = q.Encode()
 
 	req.Header.Set("Content-Type", "application/hujson")
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 
 	b, resp, err := c.sendRequest(req)
 	if err != nil {
@@ -474,7 +476,9 @@ func (c *Client) ValidateACLJSON(ctx context.Context, source, dest string) (test
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 
 	b, resp, err := c.sendRequest(req)
 	if err != nil {

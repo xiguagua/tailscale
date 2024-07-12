@@ -11,11 +11,16 @@
 package tailscale
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 // I_Acknowledge_This_API_Is_Unstable must be set true to use this package
@@ -71,7 +76,7 @@ func (c *Client) baseURL() string {
 //
 // Most users will use AuthKey.
 type AuthMethod interface {
-	modifyRequest(req *http.Request)
+	modifyRequest(req *http.Request) error
 }
 
 // APIKey is an AuthMethod for NewClient that authenticates requests
@@ -82,10 +87,41 @@ func (ak APIKey) modifyRequest(req *http.Request) {
 	req.SetBasicAuth(string(ak), "")
 }
 
-func (c *Client) setAuth(r *http.Request) {
-	if c.auth != nil {
-		c.auth.modifyRequest(r)
+func NewOAuth2AuthMethod(ctx context.Context, cfg clientcredentials.Config) AuthMethod {
+	return &oauth2Auth{
+		src:    cfg.TokenSource(ctx),
+		scopes: strings.Join(cfg.Scopes, " "),
 	}
+}
+
+// oauth2Auth is an AuthMethod for NewClient that authenticates requests
+// using an oauth flow.
+type oauth2Auth struct {
+	src    oauth2.TokenSource
+	scopes string
+}
+
+func (o *oauth2Auth) modifyRequest(req *http.Request) error {
+	token, err := o.src.Token()
+	if err != nil {
+		return err
+	}
+
+	if scopes, ok := token.Extra("scope").(string); !ok || scopes != o.scopes {
+		return fmt.Errorf("requested scopes %s but got %s", o.scopes, scopes)
+	}
+
+	token.SetAuthHeader(req)
+
+	return nil
+}
+
+func (c *Client) setAuth(r *http.Request) error {
+	if c.auth != nil {
+		return c.auth.modifyRequest(r)
+	}
+
+	return nil
 }
 
 // NewClient is a convenience method for instantiating a new Client.
@@ -109,7 +145,9 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if !I_Acknowledge_This_API_Is_Unstable {
 		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
 	}
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 	return c.httpClient().Do(req)
 }
 
@@ -119,7 +157,9 @@ func (c *Client) sendRequest(req *http.Request) ([]byte, *http.Response, error) 
 	if !I_Acknowledge_This_API_Is_Unstable {
 		return nil, nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
 	}
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, nil, err
+	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return nil, resp, err
