@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/tailscale/hujson"
 	"golang.org/x/oauth2/clientcredentials"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -30,6 +32,7 @@ import (
 // - OAuth client must have device write for tag:e2e-test-proxy tag
 func TestProxy(t *testing.T) {
 	ctx := context.Background()
+	ts := tsnetServerWithTag(t, ctx, "tag:e2e-test-proxy")
 	cfg := config.GetConfigOrDie()
 	cl, err := client.New(cfg, client.Options{})
 	if err != nil {
@@ -78,7 +81,6 @@ func TestProxy(t *testing.T) {
 	//     }]
 	//   }
 	// }]
-	ts := tsnetServerWithTag(t, ctx, "tag:e2e-test-proxy")
 	proxyCfg := &rest.Config{
 		Host: fmt.Sprintf("https://%s:443", hostNameFromOperatorSecret(t, operatorSecret)),
 		Dial: ts.Dial,
@@ -106,14 +108,41 @@ func TestProxy(t *testing.T) {
 }
 
 func tsnetServerWithTag(t *testing.T, ctx context.Context, tag string) *tsnet.Server {
+	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 	credentials := clientcredentials.Config{
 		ClientID:     os.Getenv("TS_API_CLIENT_ID"),
 		ClientSecret: os.Getenv("TS_API_CLIENT_SECRET"),
 		TokenURL:     "https://login.tailscale.com/api/v2/oauth/token",
-		Scopes:       []string{"device"}, // TODO: Add acl scope and ensure ACLs as part of function
+		Scopes:       []string{"devices", "acl"},
 	}
 	tsClient := tailscale.NewClient("-", nil)
-	tsClient.HTTPClient = credentials.Client(context.Background())
+	tsClient.HTTPClient = credentials.Client(ctx)
+
+	acls, err := tsClient.ACLHuJSON(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hj, err := hujson.Parse([]byte(acls.ACL))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const test = "test-proxy"
+	patches := append(
+		deleteTestGrants(test, &hj),
+		addTestGrant(t, test, testProxyGrant),
+	)
+	patchesS := fmt.Sprintf("[%s]", strings.Join(patches, ","))
+
+	if err := hj.Patch([]byte(patchesS)); err != nil {
+		t.Fatal(err)
+	}
+
+	hj.Format()
+	acls.ACL = hj.String()
+	if _, err := tsClient.SetACLHuJSON(ctx, *acls, true); err != nil {
+		t.Fatal(err)
+	}
 
 	caps := tailscale.KeyCapabilities{
 		Devices: tailscale.KeyDeviceCapabilities{
@@ -126,7 +155,6 @@ func tsnetServerWithTag(t *testing.T, ctx context.Context, tag string) *tsnet.Se
 		},
 	}
 
-	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 	authKey, authKeyMeta, err := tsClient.CreateKey(ctx, caps)
 	if err != nil {
 		t.Fatal(err)
@@ -195,3 +223,51 @@ func updateAndCleanup(t *testing.T, ctx context.Context, cl client.Client, obj c
 func get(ctx context.Context, cl client.Client, obj client.Object) error {
 	return cl.Get(ctx, client.ObjectKeyFromObject(obj), obj)
 }
+
+func addTestGrant(t *testing.T, test, grant string) string {
+	v, err := hujson.Parse([]byte(grant))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add the managed comment to the first line of the grant object contents.
+	v.Value.(*hujson.Object).Members[0].Name.BeforeExtra = hujson.Extra(fmt.Sprintf("%s: %s\n", e2eManagedComment, test))
+
+	return fmt.Sprintf(`{"op": "add", "path": "/grants/-", "value": %s}`, v.String())
+}
+
+func deleteTestGrants(test string, acls *hujson.Value) []string {
+	grants := acls.Find("/grants")
+
+	var patches []string
+	for i, g := range grants.Value.(*hujson.Array).Elements {
+		members := g.Value.(*hujson.Object).Members
+		if len(members) == 0 {
+			continue
+		}
+		comment := strings.TrimSpace(string(members[0].Name.BeforeExtra))
+		if name, found := strings.CutPrefix(comment, e2eManagedComment+": "); found && name == test {
+			patches = append(patches, fmt.Sprintf(`{"op": "remove", "path": "/grants/%d"}`, i))
+		}
+	}
+
+	// Remove in reverse order so we don't affect the found indices as we mutate.
+	slices.Reverse(patches)
+
+	return patches
+}
+
+const (
+	e2eManagedComment = "// This grant is managed by the k8s-operator e2e tests"
+	testProxyGrant    = `{
+	"src": ["tag:e2e-test-proxy"],
+	"dst": ["tag:k8s-operator"],
+	"app": {
+		"tailscale.com/cap/kubernetes": [{
+			"impersonate": {
+				"groups": ["ts:e2e-test-proxy"],
+			},
+		}],
+	},
+}`
+)
