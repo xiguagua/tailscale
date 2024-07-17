@@ -276,8 +276,12 @@ type LogOptions struct {
 	// Now is a function giving the current time. Defaults to [time.Now].
 	Now func() time.Time
 
+	// QuietLogging suppresses all logging of handled HTTP requests, even if
+	// there are errors or status codes considered unsuccessful. Use this option
+	// to add your own logging with OnCompletion.
+	QuietLogging bool
 	// QuietLoggingIfSuccessful suppresses logging of handled HTTP requests
-	// where the request's response status code is 200 or 304.
+	// where the error is empty and status code is 200 or 304.
 	QuietLoggingIfSuccessful bool
 
 	// StatusCodeCounters maintains counters of status code classes.
@@ -520,7 +524,7 @@ func (h logHandler) logRequest(r *http.Request, lw *loggingResponseWriter, msg A
 		msg.Code = lw.code
 	}
 
-	if !h.opts.QuietLoggingIfSuccessful || (msg.Code != http.StatusOK && msg.Code != http.StatusNotModified) {
+	if !h.opts.QuietLogging && !(h.opts.QuietLoggingIfSuccessful && msg.Err == "" && (msg.Code == http.StatusOK || msg.Code == http.StatusNotModified)) {
 		h.opts.Logf("%s", msg)
 	}
 
