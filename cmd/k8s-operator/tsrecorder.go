@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sync"
@@ -18,11 +19,14 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 )
 
@@ -38,17 +42,22 @@ var gaugeTSRecorderResources = clientmetric.NewGauge("k8s_tsrecorder_resources")
 // TSRecorder CRs.
 type TSRecorderReconciler struct {
 	client.Client
-	logger      *zap.SugaredLogger
+	l           *zap.SugaredLogger
 	recorder    record.EventRecorder
 	clock       tstime.Clock
 	tsNamespace string
+	tsClient    tsClient
 
 	mu          sync.Mutex           // protects following
 	tsRecorders set.Slice[types.UID] // for tsrecorders gauge
 }
 
+func (r *TSRecorderReconciler) logger(name string) *zap.SugaredLogger {
+	return r.l.With("TSRecorder", name)
+}
+
 func (r *TSRecorderReconciler) Reconcile(ctx context.Context, req reconcile.Request) (_ reconcile.Result, err error) {
-	logger := r.logger.With("TSRecorder", req.Name)
+	logger := r.logger(req.Name)
 	logger.Debugf("starting reconcile")
 	defer logger.Debugf("reconcile finished")
 
@@ -68,7 +77,7 @@ func (r *TSRecorderReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			return reconcile.Result{}, nil
 		}
 
-		if done, err := r.maybeCleanup(ctx, logger, tsr); err != nil {
+		if done, err := r.maybeCleanup(ctx, tsr); err != nil {
 			return reconcile.Result{}, err
 		} else if !done {
 			logger.Debugf("TSRecorder resource cleanup not yet finished, will retry...")
@@ -115,7 +124,7 @@ func (r *TSRecorderReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		return setStatus(tsr, tsapi.TSRecorderReady, metav1.ConditionFalse, reasonTSRecorderInvalid, message)
 	}
 
-	if err = r.maybeProvision(ctx, logger, tsr); err != nil {
+	if err = r.maybeProvision(ctx, tsr); err != nil {
 		logger.Errorf("error creating TSRecorder resources: %w", err)
 		message := fmt.Sprintf("failed creating TSRecorder: %s", err)
 		r.recorder.Eventf(tsr, corev1.EventTypeWarning, reasonTSRecorderCreationFailed, message)
@@ -126,28 +135,20 @@ func (r *TSRecorderReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	return setStatus(tsr, tsapi.TSRecorderReady, metav1.ConditionTrue, reasonTSRecorderCreated, reasonTSRecorderCreated)
 }
 
-func (r *TSRecorderReconciler) maybeProvision(ctx context.Context, logger *zap.SugaredLogger, tsr *tsapi.TSRecorder) error {
-	hostname := tsr.Name + "-tsrecorder"
-	if tsr.Spec.Hostname != "" {
-		hostname = string(tsr.Spec.Hostname)
-	}
-	crl := childResourceLabels(tsr.Name, r.tsNamespace, "tsrecorder")
-
-	sts := &tailscaleSTSConfig{
-		ParentResourceName:  tsr.Name,
-		ParentResourceUID:   string(tsr.UID),
-		Hostname:            hostname,
-		ChildResourceLabels: crl,
-		Tags:                tsr.Spec.Tags.Stringify(),
-	}
+func (r *TSRecorderReconciler) maybeProvision(ctx context.Context, tsr *tsapi.TSRecorder) error {
+	// logger := r.logger(tsr.Name)
+	// hostname := tsr.Name + "-tsrecorder"
+	// if tsr.Spec.Hostname != "" {
+	// 	hostname = string(tsr.Spec.Hostname)
+	// }
 
 	r.mu.Lock()
 	r.tsRecorders.Add(tsr.UID)
 	gaugeTSRecorderResources.Set(int64(r.tsRecorders.Len()))
 	r.mu.Unlock()
 
-	depl := statefulSet(tsr)
-	if _, err := createOrUpdate(ctx, r.Client, tsr.Namespace, &depl, func(d *appsv1.Deployment) {
+	depl := tsrStatefulSet(tsr)
+	if _, err := createOrUpdate(ctx, r.Client, tsr.Namespace, &depl, func(d *appsv1.StatefulSet) {
 		d.ObjectMeta.Labels = depl.ObjectMeta.Labels
 		d.ObjectMeta.Annotations = depl.ObjectMeta.Annotations
 		d.Spec = depl.Spec
@@ -155,32 +156,35 @@ func (r *TSRecorderReconciler) maybeProvision(ctx context.Context, logger *zap.S
 		return err
 	}
 
-	_, tsHost, ips, err := r.ssr.DeviceInfo(ctx, crl)
-	if err != nil {
-		return err
-	}
+	// TODO
+	// _, tsHost, ips, err := r.ssr.DeviceInfo(ctx, crl)
+	// if err != nil {
+	// 	return err
+	// }
 
-	if tsHost == "" {
-		logger.Debugf("no Tailscale hostname known yet, waiting for connector pod to finish auth")
-		// No hostname yet. Wait for the connector pod to auth.
-		tsr.Status.TailnetIPs = nil
-		tsr.Status.Hostname = ""
-		return nil
-	}
+	// if tsHost == "" {
+	// 	logger.Debugf("no Tailscale hostname known yet, waiting for connector pod to finish auth")
+	// 	// No hostname yet. Wait for the connector pod to auth.
+	// 	tsr.Status.TailnetIPs = nil
+	// 	tsr.Status.Hostname = ""
+	// 	return nil
+	// }
 
-	tsr.Status.TailnetIPs = ips
-	tsr.Status.Hostname = tsHost
+	// tsr.Status.TailnetIPs = ips
+	// tsr.Status.Hostname = tsHost
 
 	return nil
 }
 
-func (r *TSRecorderReconciler) maybeCleanup(ctx context.Context, logger *zap.SugaredLogger, tsr *tsapi.TSRecorder) (bool, error) {
-	if done, err := r.ssr.Cleanup(ctx, logger, childResourceLabels(tsr.Name, r.tsNamespace, "tsrecorder")); err != nil {
-		return false, fmt.Errorf("failed to cleanup TSRecorder resources: %w", err)
-	} else if !done {
-		logger.Debugf("TSRecorder cleanup not done yet, waiting for next reconcile")
-		return false, nil
-	}
+func (r *TSRecorderReconciler) maybeCleanup(ctx context.Context, tsr *tsapi.TSRecorder) (bool, error) {
+	logger := r.logger(tsr.Name)
+	// TODO
+	// if done, err := r.ssr.Cleanup(ctx, logger, childResourceLabels(tsr.Name, r.tsNamespace, "tsrecorder")); err != nil {
+	// 	return false, fmt.Errorf("failed to cleanup TSRecorder resources: %w", err)
+	// } else if !done {
+	// 	logger.Debugf("TSRecorder cleanup not done yet, waiting for next reconcile")
+	// 	return false, nil
+	// }
 
 	// Unlike most log entries in the reconcile loop, this will get printed
 	// exactly once at the very end of cleanup, because the final step of
@@ -194,6 +198,105 @@ func (r *TSRecorderReconciler) maybeCleanup(ctx context.Context, logger *zap.Sug
 	return true, nil
 }
 
+type secretMeta struct {
+	name    string
+	hash    string
+	configs tailscaleConfigs
+}
+
+func (r *TSRecorderReconciler) createOrGetSecrets(ctx context.Context, tsr *tsapi.TSRecorder) (map[int]secretMeta, error) {
+	logger := r.logger(tsr.Name)
+	secrets := make(map[int]secretMeta)
+	for i := range int(tsr.Spec.Replicas) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            fmt.Sprintf("%s-%d", tsr.Name, i),
+				Namespace:       tsr.Namespace,
+				Labels:          labels("tsrecorder", tsr.Name),
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(tsr, tsapi.SchemeGroupVersion.WithKind("TSRecorder"))},
+			},
+		}
+		var orig *corev1.Secret // unmodified copy of secret
+		if err := r.Get(ctx, client.ObjectKeyFromObject(secret), secret); err == nil {
+			logger.Debugf("secret %s/%s already exists", secret.GetNamespace(), secret.GetName())
+			orig = secret.DeepCopy()
+		} else if !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+
+		var authKey string
+		if orig == nil {
+			// Initially it contains only tailscaled config, but when the
+			// proxy starts, it will also store there the state, certs and
+			// ACME account key.
+			var sts appsv1.StatefulSet
+			stsKey := types.NamespacedName{
+				Namespace: tsr.Namespace,
+				Name:      tsr.Name,
+			}
+			if err := r.Get(ctx, stsKey, &sts); err != nil {
+				return nil, err
+			}
+			if sts.Name != "" {
+				// StatefulSet exists, so we have already created the secret.
+				// If the secret is missing, they should delete the StatefulSet.
+				logger.Errorf("tsrecorder secret doesn't exist, but the corresponding StatefulSet %s/%s already does. Something is wrong, please delete the TSRecorder CR", sts.GetNamespace(), sts.GetName())
+				return nil, nil
+			}
+			// Create API Key secret which is going to be used by the statefulset
+			// to authenticate with Tailscale.
+			logger.Debugf("creating authkey for new tsrecorder")
+			var err error
+			authKey, err = newAuthKey(ctx, r.tsClient, tsr.Spec.Tags.Stringify())
+			if err != nil {
+				return nil, err
+			}
+		}
+		configs, err := tsrTailscaledConfig(tsr.Spec.Hostname, authKey, orig)
+		if err != nil {
+			return nil, fmt.Errorf("error creating tailscaled config: %w", err)
+		}
+		hash, err := tailscaledConfigHash(configs)
+		if err != nil {
+			return nil, fmt.Errorf("error calculating hash of tailscaled configs: %w", err)
+		}
+
+		latest := tailcfg.CapabilityVersion(-1)
+		var latestConfig ipn.ConfigVAlpha
+		for key, val := range configs {
+			fn := tsoperator.TailscaledConfigFileNameForCap(key)
+			b, err := json.Marshal(val)
+			if err != nil {
+				return nil, fmt.Errorf("error marshalling tailscaled config: %w", err)
+			}
+			mak.Set(&secret.StringData, fn, string(b))
+			if key > latest {
+				latest = key
+				latestConfig = val
+			}
+		}
+
+		if orig != nil {
+			logger.Debugf("patching the existing proxy Secret with tailscaled config %s", sanitizeConfigBytes(latestConfig))
+			if err := r.Patch(ctx, secret, client.MergeFrom(orig)); err != nil {
+				return nil, err
+			}
+		} else {
+			logger.Debugf("creating a new Secret for the proxy with tailscaled config %s", sanitizeConfigBytes(latestConfig))
+			if err := r.Create(ctx, secret); err != nil {
+				return nil, err
+			}
+		}
+
+		secrets[i] = secretMeta{
+			name:    secret.Name,
+			hash:    hash,
+			configs: configs,
+		}
+	}
+	return secrets, nil
+}
+
 func (r *TSRecorderReconciler) validate(_ *tsapi.TSRecorder) error {
 	return nil
 }
@@ -202,7 +305,52 @@ func markedForDeletion(tsr *tsapi.TSRecorder) bool {
 	return !tsr.DeletionTimestamp.IsZero()
 }
 
-func statefulSet(tsr *tsapi.TSRecorder) appsv1.StatefulSet {
+func tsrTailscaledConfig(hostname tsapi.Hostname, newAuthkey string, oldSecret *corev1.Secret) (tailscaleConfigs, error) {
+	conf := &ipn.ConfigVAlpha{
+		Version:             "alpha0",
+		AcceptDNS:           "false",
+		AcceptRoutes:        "false", // AcceptRoutes defaults to true
+		Locked:              "false",
+		Hostname:            ptr.To(string(hostname)),
+		NoStatefulFiltering: "false",
+	}
+
+	if newAuthkey != "" {
+		conf.AuthKey = &newAuthkey
+	} else if oldSecret != nil {
+		var err error
+		latest := tailcfg.CapabilityVersion(-1)
+		latestStr := ""
+		for k, data := range oldSecret.Data {
+			// write to StringData, read from Data as StringData is write-only
+			if len(data) == 0 {
+				continue
+			}
+			v, err := tsoperator.CapVerFromFileName(k)
+			if err != nil {
+				continue
+			}
+			if v > latest {
+				latestStr = k
+				latest = v
+			}
+		}
+		// Allow for configs that don't contain an auth key. Perhaps
+		// users have some mechanisms to delete them. Auth key is
+		// normally not needed after the initial login.
+		if latestStr != "" {
+			conf.AuthKey, err = readAuthKey(oldSecret, latestStr)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	capVerConfigs := make(map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha)
+	capVerConfigs[95] = *conf
+	return capVerConfigs, nil
+}
+
+func tsrStatefulSet(tsr *tsapi.TSRecorder) appsv1.StatefulSet {
 	return appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            tsr.Name,
@@ -248,7 +396,7 @@ func statefulSet(tsr *tsapi.TSRecorder) appsv1.StatefulSet {
 											LocalObjectReference: corev1.LocalObjectReference{
 												Name: "recorder",
 											},
-											Key: "key",
+											Key: "authkey",
 										},
 									},
 								},
@@ -297,13 +445,13 @@ func statefulSet(tsr *tsapi.TSRecorder) appsv1.StatefulSet {
 	}
 }
 
-func sa(tsr *tsapi.TSRecorder) corev1.ServiceAccount {
+func tsrServiceAccount(tsr *tsapi.TSRecorder) corev1.ServiceAccount {
 	return corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            tsr.Name,
 			Namespace:       tsr.Namespace,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(tsr, tsapi.SchemeGroupVersion.WithKind("TSRecorder"))},
 			Labels:          labels("tsrecorder", tsr.Name),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(tsr, tsapi.SchemeGroupVersion.WithKind("TSRecorder"))},
 		},
 	}
 }
