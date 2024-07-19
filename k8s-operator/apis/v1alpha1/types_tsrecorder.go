@@ -35,7 +35,7 @@ import (
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Namespace,shortName=rec
+// +kubebuilder:resource:scope=Namespaced,shortName=rec
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=`.status.conditions[?(@.type == "RecorderReady")].reason`,description="Status of the deployed TSRecorder resources."
 
 type TSRecorder struct {
@@ -49,6 +49,15 @@ type TSRecorder struct {
 	// and managed by the Tailscale operator.
 	// +optional
 	Status TSRecorderStatus `json:"status"`
+}
+
+// +kubebuilder:object:root=true
+
+type TSRecorderList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	Items []TSRecorder `json:"items"`
 }
 
 type TSRecorderSpec struct {

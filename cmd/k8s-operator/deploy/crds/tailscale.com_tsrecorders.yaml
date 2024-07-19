@@ -13,7 +13,7 @@ spec:
     shortNames:
       - rec
     singular: tsrecorder
-  scope: Namespace
+  scope: Namespaced
   versions:
     - additionalPrinterColumns:
         - description: Status of the deployed TSRecorder resources.

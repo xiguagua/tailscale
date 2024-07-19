@@ -147,13 +147,24 @@ func (r *TSRecorderReconciler) maybeProvision(ctx context.Context, tsr *tsapi.TS
 	gaugeTSRecorderResources.Set(int64(r.tsRecorders.Len()))
 	r.mu.Unlock()
 
-	depl := tsrStatefulSet(tsr)
-	if _, err := createOrUpdate(ctx, r.Client, tsr.Namespace, &depl, func(d *appsv1.StatefulSet) {
-		d.ObjectMeta.Labels = depl.ObjectMeta.Labels
-		d.ObjectMeta.Annotations = depl.ObjectMeta.Annotations
-		d.Spec = depl.Spec
+	_, err := r.createOrGetSecrets(ctx, tsr)
+	if err != nil {
+		return fmt.Errorf("error creating secrets: %w", err)
+	}
+	sa := tsrServiceAccount(tsr)
+	if _, err := createOrUpdate(ctx, r.Client, tsr.Namespace, &sa, func(s *corev1.ServiceAccount) {
+		s.ObjectMeta.Labels = sa.ObjectMeta.Labels
+		s.ObjectMeta.Annotations = sa.ObjectMeta.Annotations
 	}); err != nil {
-		return err
+		return fmt.Errorf("error creating service account: %w", err)
+	}
+	ss := tsrStatefulSet(tsr)
+	if _, err := createOrUpdate(ctx, r.Client, tsr.Namespace, &ss, func(s *appsv1.StatefulSet) {
+		s.ObjectMeta.Labels = ss.ObjectMeta.Labels
+		s.ObjectMeta.Annotations = ss.ObjectMeta.Annotations
+		s.Spec = ss.Spec
+	}); err != nil {
+		return fmt.Errorf("error creating stateful set: %w", err)
 	}
 
 	// TODO
@@ -234,10 +245,9 @@ func (r *TSRecorderReconciler) createOrGetSecrets(ctx context.Context, tsr *tsap
 				Namespace: tsr.Namespace,
 				Name:      tsr.Name,
 			}
-			if err := r.Get(ctx, stsKey, &sts); err != nil {
+			if err := r.Get(ctx, stsKey, &sts); err != nil && !apierrors.IsNotFound(err) {
 				return nil, err
-			}
-			if sts.Name != "" {
+			} else if err == nil {
 				// StatefulSet exists, so we have already created the secret.
 				// If the secret is missing, they should delete the StatefulSet.
 				logger.Errorf("tsrecorder secret doesn't exist, but the corresponding StatefulSet %s/%s already does. Something is wrong, please delete the TSRecorder CR", sts.GetNamespace(), sts.GetName())
@@ -388,18 +398,7 @@ func tsrStatefulSet(tsr *tsapi.TSRecorder) appsv1.StatefulSet {
 								}
 								return fmt.Sprintf("%s:%s", repo, tag)
 							}(),
-							Env: []corev1.EnvVar{ // TODO: deploy and use a secret
-								{
-									Name: "TS_AUTHKEY",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: "recorder",
-											},
-											Key: "authkey",
-										},
-									},
-								},
+							Env: []corev1.EnvVar{
 								{
 									Name: "TS_KUBE_SECRET",
 									ValueFrom: &corev1.EnvVarSource{
@@ -410,6 +409,7 @@ func tsrStatefulSet(tsr *tsapi.TSRecorder) appsv1.StatefulSet {
 									},
 								},
 							},
+							Command: []string{"/tsrecorder"},
 							Args: func() []string {
 								args := []string{
 									"--statedir=/data/state",
@@ -461,6 +461,6 @@ func labels(app, instance string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":       app,
 		"app.kubernetes.io/instance":   instance,
-		"app.kubernetes.io/managed-by": "tailscale.com/operator",
+		"app.kubernetes.io/managed-by": "tailscale-operator",
 	}
 }

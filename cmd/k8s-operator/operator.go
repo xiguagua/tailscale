@@ -395,8 +395,9 @@ func runReconcilers(opts reconcilerOpts) {
 			recorder:    eventRecorder,
 			tsNamespace: opts.tailscaleNamespace,
 			Client:      mgr.GetClient(),
-			logger:      opts.log.Named("nameserver-reconciler"),
+			l:           opts.log.Named("tsrecorder-reconciler"),
 			clock:       tstime.DefaultClock{},
+			tsClient:    opts.tsClient,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create nameserver reconciler: %v", err)
