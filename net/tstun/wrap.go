@@ -175,6 +175,8 @@ type Wrapper struct {
 	// PostFilterPacketOutboundToWireGuard is the outbound filter function that runs after the main filter.
 	PostFilterPacketOutboundToWireGuard FilterFunc
 
+	PostFilterPacketVectorInboundFlush func()
+
 	// OnTSMPPongReceived, if non-nil, is called whenever a TSMP pong arrives.
 	OnTSMPPongReceived func(packet.TSMPPongReply)
 
@@ -1184,6 +1186,9 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 				i++
 			}
 		}
+	}
+	if t.PostFilterPacketVectorInboundFlush != nil {
+		t.PostFilterPacketVectorInboundFlush()
 	}
 	if t.disableFilter {
 		i = len(buffs)

@@ -4,12 +4,18 @@
 package netstack
 
 import (
+	"bytes"
 	"context"
 	"sync"
 
+	"github.com/tailscale/wireguard-go/tun"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/stack/gro"
+	"tailscale.com/net/packet"
+	"tailscale.com/types/ipproto"
 )
 
 type queue struct {
@@ -78,28 +84,30 @@ var _ stack.GSOEndpoint = (*linkEndpoint)(nil)
 
 // linkEndpoint implements stack.LinkEndpoint and stack.GSOEndpoint. Outbound
 // packets written by gVisor towards Tailscale are stored in a channel.
-// Inbound is fed to gVisor via InjectInbound. This is loosely modeled after
-// gvisor.dev/pkg/tcpip/link/channel.Endpoint.
+// Inbound is fed to gVisor via injectInbound or enqueueGRO. This is loosely
+// modeled after gvisor.dev/pkg/tcpip/link/channel.Endpoint.
 type linkEndpoint struct {
-	LinkEPCapabilities stack.LinkEndpointCapabilities
-	SupportedGSOKind   stack.SupportedGSO
+	SupportedGSOKind stack.SupportedGSO
 
 	mu         sync.RWMutex // mu guards the following fields
 	dispatcher stack.NetworkDispatcher
 	linkAddr   tcpip.LinkAddress
 	mtu        uint32
 
-	q *queue // outbound
+	q   *queue // outbound
+	gro gro.GRO
 }
 
 func newLinkEndpoint(size int, mtu uint32, linkAddr tcpip.LinkAddress) *linkEndpoint {
-	return &linkEndpoint{
+	le := &linkEndpoint{
 		q: &queue{
 			c: make(chan *stack.PacketBuffer, size),
 		},
 		mtu:      mtu,
 		linkAddr: linkAddr,
 	}
+	le.gro.Init(true)
+	return le
 }
 
 // Close closes l. Further packet injections will return an error, and all
@@ -107,6 +115,7 @@ func newLinkEndpoint(size int, mtu uint32, linkAddr tcpip.LinkAddress) *linkEndp
 // WritePackets.
 func (l *linkEndpoint) Close() {
 	l.q.Close()
+	l.gro.Flush()
 	l.Drain()
 }
 
@@ -131,19 +140,111 @@ func (l *linkEndpoint) Drain() int {
 	return c
 }
 
-// NumQueued returns the number of packet queued for outbound.
+// NumQueued returns the number of packets queued for outbound.
 func (l *linkEndpoint) NumQueued() int {
 	return l.q.Num()
 }
 
-// InjectInbound injects an inbound packet. If the endpoint is not attached, the
-// packet is not delivered.
-func (l *linkEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+// rxChecksumOffload validates IPv4, TCP, and UDP header checksums in p,
+// returning an equivalent *stack.PacketBuffer if they are valid, otherwise nil.
+// The set of headers validated covers where gVisor would perform validation if
+// !stack.PacketBuffer.RXChecksumValidated, i.e. it satisfies
+// stack.CapabilityRXChecksumOffload.
+func rxChecksumOffload(p *packet.Parsed) *stack.PacketBuffer {
+	var (
+		pn           tcpip.NetworkProtocolNumber
+		csumStart    int
+		csumRequired bool
+	)
+	buf := p.Buffer()
+
+	switch p.IPVersion {
+	case 4:
+		if len(buf) < 20 {
+			return nil
+		}
+		csumStart = int((buf[0] & 0x0F) * 4)
+		if csumStart < 20 || csumStart > 60 || len(buf) < csumStart {
+			return nil
+		}
+		if ^tun.Checksum(buf[:csumStart], 0) != 0 {
+			return nil
+		}
+		pn = header.IPv4ProtocolNumber
+	case 6:
+		if len(buf) < 40 {
+			return nil
+		}
+		csumStart = 40
+		pn = header.IPv6ProtocolNumber
+	}
+	if p.IPProto == ipproto.TCP || p.IPProto == ipproto.UDP {
+		csumRequired = true
+	}
+
+	if csumRequired {
+		lenForPseudo := len(buf) - csumStart
+		csum := tun.PseudoHeaderChecksum(
+			uint8(p.IPProto),
+			p.Src.Addr().AsSlice(),
+			p.Dst.Addr().AsSlice(),
+			uint16(lenForPseudo))
+		csum = tun.Checksum(buf[csumStart:], csum)
+		if ^csum != 0 {
+			return nil
+		}
+	}
+
+	packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(bytes.Clone(buf)),
+	})
+	packetBuf.NetworkProtocolNumber = pn
+	// Setting this is not technically required. gVisor overrides where
+	// stack.CapabilityRXChecksumOffload is advertised from Capabilities().
+	// https://github.com/google/gvisor/blob/64c016c92987cc04dfd4c7b091ddd21bdad875f8/pkg/tcpip/stack/nic.go#L763
+	// This is also why we offload for all packets since we cannot signal this
+	// per-packet.
+	packetBuf.RXChecksumValidated = true
+	return packetBuf
+}
+
+func (l *linkEndpoint) injectInbound(p *packet.Parsed) {
 	l.mu.RLock()
 	d := l.dispatcher
 	l.mu.RUnlock()
 	if d != nil {
-		d.DeliverNetworkPacket(protocol, pkt)
+		pkt := rxChecksumOffload(p)
+		if pkt != nil {
+			d.DeliverNetworkPacket(pkt.NetworkProtocolNumber, pkt)
+			pkt.DecRef()
+		}
+	}
+}
+
+// enqueueGRO enqueues the provided pkt for GRO. This does not flush packets;
+// that must be called explicitly via flushGRO(). enqueueGRO is NOT thread-safe.
+func (l *linkEndpoint) enqueueGRO(p *packet.Parsed) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.gro.Dispatcher != nil {
+		pkt := rxChecksumOffload(p)
+		if pkt != nil {
+			// TODO(jwhited): gro.Enqueue() duplicates a lot of p.Decode().
+			//  We may want to push stack.PacketBuffer further up, or inversely
+			//  push packet.Parsed down into refactored GRO logic.
+			l.gro.Enqueue(pkt)
+			pkt.DecRef()
+		}
+	}
+}
+
+// flushGRO flushes previously enqueueGRO'd packets. flushGRO is NOT
+// thread-safe.
+func (l *linkEndpoint) flushGRO() {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.gro.Dispatcher != nil {
+		l.gro.Flush()
 	}
 }
 
@@ -153,6 +254,7 @@ func (l *linkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.dispatcher = dispatcher
+	l.gro.Dispatcher = dispatcher
 }
 
 // IsAttached implements stack.LinkEndpoint.IsAttached.
@@ -178,7 +280,9 @@ func (l *linkEndpoint) SetMTU(mtu uint32) {
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
 func (l *linkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
-	return l.LinkEPCapabilities
+	// We are required to offload RX checksum validation for the purposes of
+	// GRO.
+	return stack.CapabilityRXChecksumOffload
 }
 
 // GSOMaxSize implements stack.GSOEndpoint.
