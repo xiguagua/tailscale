@@ -78,6 +78,8 @@ func (v PrefsView) WantRunning() bool                           { return v.ж.Wa
 func (v PrefsView) LoggedOut() bool                             { return v.ж.LoggedOut }
 func (v PrefsView) ShieldsUp() bool                             { return v.ж.ShieldsUp }
 func (v PrefsView) AdvertiseTags() views.Slice[string]          { return views.SliceOf(v.ж.AdvertiseTags) }
+func (v PrefsView) NatcConsensusAddr() string                   { return v.ж.NatcConsensusAddr }
+func (v PrefsView) NatcConsensusJoin() string                   { return v.ж.NatcConsensusJoin }
 func (v PrefsView) Hostname() string                            { return v.ж.Hostname }
 func (v PrefsView) NotepadURLs() bool                           { return v.ж.NotepadURLs }
 func (v PrefsView) ForceDaemon() bool                           { return v.ж.ForceDaemon }
@@ -115,6 +117,8 @@ var _PrefsViewNeedsRegeneration = Prefs(struct {
 	LoggedOut              bool
 	ShieldsUp              bool
 	AdvertiseTags          []string
+	NatcConsensusAddr      string
+	NatcConsensusJoin      string
 	Hostname               string
 	NotepadURLs            bool
 	ForceDaemon            bool

@@ -59,6 +59,7 @@ import (
 	"tailscale.com/ipn/policy"
 	"tailscale.com/log/sockstatlog"
 	"tailscale.com/logpolicy"
+	ippool "tailscale.com/natcippool"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
@@ -3661,6 +3662,44 @@ func (b *LocalBackend) blockEngineUpdates(block bool) {
 	b.mu.Unlock()
 }
 
+func (b *LocalBackend) natc(nm *netmap.NetworkMap, prefs ipn.PrefsView) {
+	if prefs.NatcConsensusAddr() != "" {
+		// TODO: find a better id for this
+		a := prefs.NatcConsensusAddr()
+		id := a[len(a)-1 : len(a)]
+		// start a goroutine for this node to be a member of the consensus protocol for
+		// determining which ip addresses are available for natc.
+		go func() {
+			b.logf("Starting ippool consensus membership for natc")
+			ippool.StartConsensusMember(id, prefs.NatcConsensusAddr(), prefs.NatcConsensusJoin())
+		}()
+
+		f := ippool.NewConsensusClient(prefs.NatcConsensusAddr(), prefs.NatcConsensusJoin(), b.logf)
+
+		// TODO: this is temporary for exercising the protocol, add actual use
+		go func() {
+			i := 0
+			ticker := time.NewTicker(4 * time.Second)
+			for {
+				select {
+				case <-b.ctx.Done():
+					ticker.Stop()
+					return
+				case <-ticker.C:
+					fmt.Println("TICK!*************")
+					i++
+					if i > 10 {
+						i = 1
+					}
+					domain := fmt.Sprintf("%d.example.com", rand.Int()%11)
+					ip, err := f.CheckOut(tailcfg.NodeID(i), domain)
+					fmt.Println("checkout", i, domain, ip, err)
+				}
+			}
+		}()
+	}
+}
+
 // reconfigAppConnectorLocked updates the app connector state based on the
 // current network map and preferences.
 // b.mu must be held.
@@ -3746,6 +3785,7 @@ func (b *LocalBackend) authReconfig() {
 	dcfg := dnsConfigForNetmap(nm, b.peers, prefs, b.logf, version.OS())
 	// If the current node is an app connector, ensure the app connector machine is started
 	b.reconfigAppConnectorLocked(nm, prefs)
+	b.natc(nm, prefs)
 	b.mu.Unlock()
 
 	if blocked {

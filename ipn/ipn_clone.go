@@ -56,6 +56,8 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	LoggedOut              bool
 	ShieldsUp              bool
 	AdvertiseTags          []string
+	NatcConsensusAddr      string
+	NatcConsensusJoin      string
 	Hostname               string
 	NotepadURLs            bool
 	ForceDaemon            bool

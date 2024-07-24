@@ -143,7 +143,9 @@ type Prefs struct {
 	// security policy. Note that advertising a tag doesn't guarantee that
 	// the control server will allow you to take on the rights for that
 	// tag.
-	AdvertiseTags []string
+	AdvertiseTags     []string
+	NatcConsensusAddr string
+	NatcConsensusJoin string
 
 	// Hostname is the hostname to use for identifying the node. If
 	// not set, os.Hostname is used.
@@ -314,6 +316,8 @@ type MaskedPrefs struct {
 	LoggedOutSet              bool                `json:",omitempty"`
 	ShieldsUpSet              bool                `json:",omitempty"`
 	AdvertiseTagsSet          bool                `json:",omitempty"`
+	NatcConsensusAddrSet      bool                `json:",omitempty"`
+	NatcConsensusJoinSet      bool                `json:",omitempty"`
 	HostnameSet               bool                `json:",omitempty"`
 	NotepadURLsSet            bool                `json:",omitempty"`
 	ForceDaemonSet            bool                `json:",omitempty"`
